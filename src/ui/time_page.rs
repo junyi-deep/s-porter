@@ -134,7 +134,7 @@ impl AppView {
                 set_input(&input, value, window, cx);
                 self.convert_datetime(window, cx);
             }
-            Err(error) => window.push_notification(error.to_string(), cx),
+            Err(error) => self.push_message(error.to_string(), window, cx),
         }
     }
 
@@ -165,7 +165,7 @@ impl AppView {
                     set_input(&state, value, window, cx);
                 }
             }
-            Err(error) => window.push_notification(format!("转换失败：{error:#}"), cx),
+            Err(error) => self.push_message(format!("转换失败：{error:#}"), window, cx),
         }
     }
 
@@ -190,7 +190,7 @@ impl AppView {
                 set_input(&datetime, value, window, cx);
                 self.convert_datetime(window, cx);
             }
-            Err(error) => window.push_notification(format!("转换失败：{error:#}"), cx),
+            Err(error) => self.push_message(format!("转换失败：{error:#}"), window, cx),
         }
     }
 
@@ -230,12 +230,12 @@ impl AppView {
                     cx,
                 ) {
                     Ok(0) => {
-                        window.push_notification("倒计时时长必须大于 0", cx);
+                        self.push_message("倒计时时长必须大于 0", window, cx);
                         return;
                     }
                     Ok(value) => self.time_tools.countdown_remaining = value,
                     Err(error) => {
-                        window.push_notification(error.to_string(), cx);
+                        self.push_message(error.to_string(), window, cx);
                         return;
                     }
                 }
@@ -256,7 +256,7 @@ impl AppView {
                 self.time_tools.countdown_remaining = value;
                 cx.notify();
             }
-            Err(error) => window.push_notification(error.to_string(), cx),
+            Err(error) => self.push_message(error.to_string(), window, cx),
         }
     }
 
@@ -282,16 +282,16 @@ impl AppView {
     }
 
     fn send_pomodoro_notification(
-        &self,
+        &mut self,
         message: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.push_notification(message.to_string(), cx);
+        self.push_message(message.to_string(), window, cx);
         if self.time_tools.pomodoro_system_notifications
             && let Err(error) = system_notification::send(message)
         {
-            window.push_notification(format!("系统通知发送失败：{error:#}"), cx);
+            self.push_message(format!("系统通知发送失败：{error:#}"), window, cx);
         }
     }
 
@@ -302,7 +302,7 @@ impl AppView {
             match self.configured_pomodoro_cycles(cx) {
                 Ok(cycles) => self.time_tools.pomodoro_total_cycles = cycles,
                 Err(error) => {
-                    window.push_notification(error.to_string(), cx);
+                    self.push_message(error.to_string(), window, cx);
                     return;
                 }
             }
@@ -314,12 +314,12 @@ impl AppView {
             if self.time_tools.pomodoro_remaining == 0 {
                 match self.pomodoro_phase_seconds(cx) {
                     Ok(0) => {
-                        window.push_notification("番茄时长必须大于 0", cx);
+                        self.push_message("番茄时长必须大于 0", window, cx);
                         return;
                     }
                     Ok(value) => self.time_tools.pomodoro_remaining = value,
                     Err(error) => {
-                        window.push_notification(error.to_string(), cx);
+                        self.push_message(error.to_string(), window, cx);
                         return;
                     }
                 }
@@ -336,13 +336,13 @@ impl AppView {
         match self.configured_pomodoro_cycles(cx) {
             Ok(cycles) => self.time_tools.pomodoro_total_cycles = cycles,
             Err(error) => {
-                window.push_notification(error.to_string(), cx);
+                self.push_message(error.to_string(), window, cx);
                 return;
             }
         }
         match self.pomodoro_phase_seconds(cx) {
             Ok(value) => self.time_tools.pomodoro_remaining = value,
-            Err(error) => window.push_notification(error.to_string(), cx),
+            Err(error) => self.push_message(error.to_string(), window, cx),
         }
         cx.notify();
     }
@@ -359,7 +359,7 @@ impl AppView {
             changed = true;
             if self.time_tools.countdown_remaining == 0 {
                 self.time_tools.countdown_running = false;
-                window.push_notification("倒计时已结束", cx);
+                self.push_message("倒计时已结束", window, cx);
             }
         }
         if self.time_tools.pomodoro_running {
@@ -413,7 +413,11 @@ fn format_duration(seconds: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn copy_button(id: impl Into<ElementId>, state: Entity<InputState>) -> Button {
+fn copy_button(
+    id: impl Into<ElementId>,
+    state: Entity<InputState>,
+    view: Entity<AppView>,
+) -> Button {
     Button::new(id)
         .xsmall()
         .ghost()
@@ -423,7 +427,9 @@ fn copy_button(id: impl Into<ElementId>, state: Entity<InputState>) -> Button {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 state.read(cx).value().to_string(),
             ));
-            window.push_notification("已复制到剪贴板", cx);
+            view.update(cx, |this, cx| {
+                this.push_message("已复制到剪贴板", window, cx)
+            });
         })
 }
 
@@ -433,12 +439,13 @@ fn timestamp_row(
     state: Entity<InputState>,
     view: Entity<AppView>,
 ) -> impl IntoElement {
+    let copy_view = view.clone();
     let convert_view = view;
     h_flex()
         .gap_3()
         .child(div().w(px(92.)).text_sm().font_medium().child(label))
         .child(div().flex_1().child(Input::new(&state)))
-        .child(copy_button(format!("copy-{key}"), state))
+        .child(copy_button(format!("copy-{key}"), state, copy_view))
         .child(
             Button::new(format!("to-time-{key}"))
                 .outline()
@@ -583,7 +590,7 @@ fn render_convert(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement
                     h_flex()
                         .gap_3()
                         .child(div().flex_1().child(Input::new(&datetime)))
-                        .child(copy_button("copy-datetime", datetime))
+                        .child(copy_button("copy-datetime", datetime, view.clone()))
                         .child(Button::new("now").outline().label("当前时间").on_click(
                             move |_, window, cx| {
                                 reset_view

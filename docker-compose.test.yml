@@ -1,0 +1,45 @@
+name: s-porter-test
+
+services:
+  ssh:
+    build:
+      context: docker/test/ssh
+    ports:
+      - "127.0.0.1:2222:22"
+      - "127.0.0.1:8888:8888"
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  nginx:
+    image: nginx:1.29-alpine
+    ports:
+      - "127.0.0.1:18080:80"
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  proxy:
+    build:
+      context: docker/test/proxy
+    network_mode: "service:ssh"
+    depends_on:
+      ssh:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8888"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+networks:
+  test-network:
+    driver: bridge

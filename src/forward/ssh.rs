@@ -1,7 +1,7 @@
-use super::ForwardConfig;
+use super::{ForwardConfig, JumpHost};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ssh2::Session;
+use ssh2::{ErrorCode, Session};
 use std::{
     collections::VecDeque,
     io::{ErrorKind, Read, Write},
@@ -15,6 +15,7 @@ use std::{
 };
 
 const MAX_LOG_LINES: usize = 500;
+const SSH_ERROR_EAGAIN: i32 = -37;
 
 pub struct TunnelHandle {
     stop: Arc<AtomicBool>,
@@ -24,12 +25,13 @@ pub struct TunnelHandle {
 }
 
 impl TunnelHandle {
-    pub fn start(config: ForwardConfig) -> Result<Self> {
+    pub fn start(config: ForwardConfig, jump_host: JumpHost) -> Result<Self> {
         config.validate()?;
+        jump_host.validate()?;
         let listener = TcpListener::bind(("127.0.0.1", config.local_port))
             .with_context(|| format!("无法监听本地端口 {}", config.local_port))?;
         listener.set_nonblocking(true)?;
-        test_connection(&config).context("启动前连通性检查失败")?;
+        test_connection(&config, &jump_host).context("启动前连通性检查失败")?;
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
         let logs = Arc::new(Mutex::new(VecDeque::new()));
@@ -38,9 +40,18 @@ impl TunnelHandle {
             &logs,
             format!(
                 "监听 127.0.0.1:{} → {}:{}（经 {}）",
-                config.local_port, config.remote_ip, config.remote_port, config.ssh_ip
+                config.local_port, config.remote_ip, config.remote_port, jump_host.name
             ),
         );
+        if config.keep_alive {
+            push_log(
+                &logs,
+                format!(
+                    "SSH 保活已启用，心跳间隔 {} 秒",
+                    config.keep_alive_interval_secs
+                ),
+            );
+        }
 
         let thread_stop = stop.clone();
         let thread_running = running.clone();
@@ -51,10 +62,11 @@ impl TunnelHandle {
                     Ok((stream, peer)) => {
                         push_log(&thread_logs, format!("收到本地连接：{peer}"));
                         let cfg = config.clone();
+                        let host = jump_host.clone();
                         let logs = thread_logs.clone();
                         let stop = thread_stop.clone();
                         thread::spawn(move || {
-                            if let Err(error) = forward_connection(stream, &cfg, &stop) {
+                            if let Err(error) = forward_connection(stream, &cfg, &host, &stop) {
                                 push_log(&logs, format!("连接失败：{error:#}"));
                             } else {
                                 push_log(&logs, format!("连接已关闭：{peer}"));
@@ -107,9 +119,10 @@ impl Drop for TunnelHandle {
     }
 }
 
-pub fn test_connection(config: &ForwardConfig) -> Result<()> {
+pub fn test_connection(config: &ForwardConfig, jump_host: &JumpHost) -> Result<()> {
     config.validate()?;
-    let session = connect(config, &config.ssh_user, &config.ssh_password)?;
+    jump_host.validate()?;
+    let session = connect(jump_host)?;
     let mut channel = session
         .channel_direct_tcpip(&config.remote_ip, config.remote_port, None)
         .context("SSH 已登录，但无法连接目标服务")?;
@@ -117,13 +130,19 @@ pub fn test_connection(config: &ForwardConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn enable_forwarding(config: &ForwardConfig) -> Result<String> {
-    config.validate()?;
-    if config.root_password.is_empty() {
+pub fn test_jump_host_connection(jump_host: &JumpHost) -> Result<()> {
+    jump_host.validate()?;
+    connect(jump_host)?;
+    Ok(())
+}
+
+pub fn enable_forwarding(jump_host: &JumpHost) -> Result<String> {
+    jump_host.validate()?;
+    if jump_host.root_password.is_empty() {
         bail!("root 密码不能为空");
     }
-    if !config
-        .root_user
+    if !jump_host
+        .root_username
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
@@ -131,17 +150,17 @@ pub fn enable_forwarding(config: &ForwardConfig) -> Result<String> {
     }
 
     // First authenticate as the normal service account, as required by the workflow.
-    let session = connect(config, &config.ssh_user, &config.ssh_password)?;
+    let session = connect(jump_host)?;
     let mut channel = session.channel_session().context("创建远端会话失败")?;
     channel
         .request_pty("xterm", None, Some((120, 40, 0, 0)))
         .context("申请远端终端失败")?;
     channel.shell().context("打开远端 shell 失败")?;
 
-    writeln!(channel, "su - {}", config.root_user)?;
+    writeln!(channel, "su - {}", jump_host.root_username)?;
     channel.flush()?;
     read_until(&mut channel, &["assword", "密码"], Duration::from_secs(10))?;
-    writeln!(channel, "{}", config.root_password)?;
+    writeln!(channel, "{}", jump_host.root_password)?;
     channel.flush()?;
     thread::sleep(Duration::from_millis(500));
 
@@ -156,10 +175,10 @@ pub fn enable_forwarding(config: &ForwardConfig) -> Result<String> {
     Ok(output)
 }
 
-fn connect(config: &ForwardConfig, user: &str, password: &str) -> Result<Session> {
-    let address = format!("{}:{}", config.ssh_ip.trim(), config.ssh_port);
-    let tcp = if let Some(proxy) = &config.http_proxy {
-        connect_via_http_proxy(config, proxy)
+pub(super) fn connect(jump_host: &JumpHost) -> Result<Session> {
+    let address = format!("{}:{}", jump_host.host.trim(), jump_host.port);
+    let tcp = if let Some(proxy) = &jump_host.http_proxy {
+        connect_via_http_proxy(jump_host, proxy)
             .with_context(|| format!("无法通过 HTTP 代理连接 SSH 服务 {address}"))?
     } else {
         connect_address(&address).with_context(|| format!("无法连接 SSH 服务 {address}"))?
@@ -170,8 +189,8 @@ fn connect(config: &ForwardConfig, user: &str, password: &str) -> Result<Session
     session.set_tcp_stream(tcp);
     session.handshake().context("SSH 握手失败")?;
     session
-        .userauth_password(user, password)
-        .with_context(|| format!("SSH 用户 {user} 认证失败"))?;
+        .userauth_password(&jump_host.username, &jump_host.password)
+        .with_context(|| format!("SSH 用户 {} 认证失败", jump_host.username))?;
     if !session.authenticated() {
         bail!("SSH 认证未通过");
     }
@@ -195,15 +214,16 @@ fn connect_address(address: &str) -> Result<TcpStream> {
 }
 
 fn connect_via_http_proxy(
-    config: &ForwardConfig,
+    jump_host: &JumpHost,
     proxy: &super::HttpProxyConfig,
 ) -> Result<TcpStream> {
     let proxy_address = format!("{}:{}", proxy.host.trim(), proxy.port);
-    let mut tcp = connect_address(&proxy_address)?;
+    let mut tcp = connect_address(&proxy_address)
+        .with_context(|| format!("无法连接 HTTP 代理 {proxy_address}"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(12)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(12)))?;
 
-    let target = format!("{}:{}", config.ssh_ip.trim(), config.ssh_port);
+    let target = format!("{}:{}", jump_host.host.trim(), jump_host.port);
     let request = http_connect_request(&target, proxy);
     tcp.write_all(request.as_bytes())?;
     tcp.flush()?;
@@ -240,18 +260,24 @@ fn http_connect_request(target: &str, proxy: &super::HttpProxyConfig) -> String 
 fn forward_connection(
     mut local: TcpStream,
     config: &ForwardConfig,
+    jump_host: &JumpHost,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let session = connect(config, &config.ssh_user, &config.ssh_password)?;
+    let session = connect(jump_host)?;
     let mut remote = session
         .channel_direct_tcpip(&config.remote_ip, config.remote_port, None)
         .context("打开 SSH direct-tcpip 通道失败")?;
+    if config.keep_alive {
+        session.set_keepalive(true, config.keep_alive_interval_secs);
+    }
     session.set_blocking(false);
     local.set_nonblocking(true)?;
     let mut local_buffer = [0_u8; 32 * 1024];
     let mut remote_buffer = [0_u8; 32 * 1024];
     let mut local_eof = false;
     let mut remote_eof = false;
+    let mut next_keep_alive =
+        Instant::now() + Duration::from_secs(config.keep_alive_interval_secs.into());
 
     while !(stop.load(Ordering::Relaxed) || local_eof && remote_eof) {
         let mut progressed = false;
@@ -278,6 +304,18 @@ fn forward_connection(
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error).context("读取 SSH 通道失败"),
+            }
+        }
+        if config.keep_alive && Instant::now() >= next_keep_alive {
+            match session.keepalive_send() {
+                Ok(seconds_to_next) => {
+                    next_keep_alive =
+                        Instant::now() + Duration::from_secs(seconds_to_next.max(1).into());
+                }
+                Err(error) if error.code() == ErrorCode::Session(SSH_ERROR_EAGAIN) => {
+                    next_keep_alive = Instant::now() + Duration::from_millis(50);
+                }
+                Err(error) => return Err(error).context("发送 SSH 保活心跳失败"),
             }
         }
         if !progressed {

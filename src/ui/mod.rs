@@ -1,6 +1,11 @@
 mod app;
+mod format_page;
 mod forward_page;
+mod jump_host_page;
+mod jump_host_picker;
+mod message_center;
 mod sidebar;
+mod ssh_page;
 mod time_page;
 mod tool_page;
 
@@ -39,6 +44,7 @@ pub fn run() {
         let window_options = WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
             window_bounds: Some(WindowBounds::centered(size(px(1180.), px(760.)), cx)),
+            window_min_size: Some(size(px(900.), px(620.))),
             ..Default::default()
         };
         cx.spawn(async move |cx| {

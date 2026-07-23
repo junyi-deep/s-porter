@@ -1,3 +1,3 @@
 mod config;
 
-pub use config::{load, save};
+pub use config::{AppConfig, QuickCommand, load, save};

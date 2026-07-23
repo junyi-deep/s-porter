@@ -56,6 +56,7 @@ fn editor_header(
     state: Entity<InputState>,
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
+    let view = cx.entity();
     let copy_state = state.clone();
     let clear_state = state;
     h_flex()
@@ -79,7 +80,9 @@ fn editor_header(
                         .on_click(move |_, window, cx| {
                             let text = copy_state.read(cx).value().to_string();
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            window.push_notification("已复制到剪贴板", cx);
+                            view.update(cx, |this, cx| {
+                                this.push_message("已复制到剪贴板", window, cx)
+                            });
                         }),
                 )
                 .child(
