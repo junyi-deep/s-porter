@@ -1,7 +1,7 @@
 use super::{ForwardConfig, JumpHost};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ssh2::{ErrorCode, Session};
+use ssh2::{ErrorCode, PtyModeOpcode, PtyModes, Session};
 use std::{
     collections::VecDeque,
     io::{ErrorKind, Read, Write},
@@ -16,6 +16,65 @@ use std::{
 
 const MAX_LOG_LINES: usize = 500;
 const SSH_ERROR_EAGAIN: i32 = -37;
+const ROOT_OK_MARKER: &str = "__S_PORTER_ROOT_OK__";
+const ROOT_FAILED_MARKER: &str = "__S_PORTER_ROOT_FAILED__";
+const FORWARDING_OK_MARKER: &str = "__S_PORTER_FORWARDING_OK__";
+const FORWARDING_INVALID_MARKER: &str = "__S_PORTER_FORWARDING_INVALID__";
+const FORWARDING_RELOAD_FAILED_MARKER: &str = "__S_PORTER_FORWARDING_RELOAD_FAILED__";
+const FORWARDING_VERIFY_FAILED_MARKER: &str = "__S_PORTER_FORWARDING_VERIFY_FAILED__";
+const ENABLE_FORWARDING_COMMAND: &str = r#"set -u
+C=/etc/ssh/sshd_config
+B="$C.s-porter.bak.$(date +%Y%m%d%H%M%S)"
+T=$(mktemp /etc/ssh/sshd_config.s-porter.XXXXXX) || exit 1
+cp -p "$C" "$B" || exit 1
+awk 'BEGIN{m=0; added=0} /^[[:space:]]*Match[[:space:]]/{if(!added){print "AllowTcpForwarding yes"; print "DisableForwarding no"; print "PermitOpen any"; added=1} m=1} {k=tolower($1)} !m && (k=="allowtcpforwarding" || k=="disableforwarding" || k=="permitopen"){next} {print} END{if(!added){print "AllowTcpForwarding yes"; print "DisableForwarding no"; print "PermitOpen any"}}' "$C" > "$T" || exit 1
+chmod --reference="$C" "$T" 2>/dev/null || chmod 600 "$T"
+chown --reference="$C" "$T" 2>/dev/null || true
+if ! sshd -t -f "$T"; then
+  rm -f "$T"
+  echo __S_PORTER_FORWARDING_INVALID__
+  exit 1
+fi
+mv "$T" "$C" || exit 1
+reload_ssh() {
+  systemctl reload sshd 2>/dev/null ||
+  systemctl reload ssh 2>/dev/null ||
+  service sshd reload 2>/dev/null ||
+  service ssh reload 2>/dev/null ||
+  { P=$(cat /run/sshd.pid 2>/dev/null || cat /var/run/sshd.pid 2>/dev/null); [ -n "$P" ] && kill -HUP "$P"; }
+}
+rollback() {
+  cp -p "$B" "$C"
+  reload_ssh >/dev/null 2>&1 || true
+}
+if ! reload_ssh; then
+  rollback
+  echo __S_PORTER_FORWARDING_RELOAD_FAILED__
+  exit 1
+fi
+E=$(sshd -T 2>/dev/null)
+if ! printf '%s\n' "$E" | grep -qx 'allowtcpforwarding yes' ||
+   ! printf '%s\n' "$E" | grep -qx 'disableforwarding no' ||
+   ! printf '%s\n' "$E" | grep -qx 'permitopen any'; then
+  rollback
+  echo __S_PORTER_FORWARDING_VERIFY_FAILED__
+  exit 1
+fi
+echo __S_PORTER_FORWARDING_OK__"#;
+
+fn forwarding_result(output: String) -> Result<String> {
+    if output.contains(FORWARDING_OK_MARKER) {
+        Ok(output)
+    } else if output.contains(FORWARDING_INVALID_MARKER) {
+        bail!("生成的 sshd_config 未通过 sshd 语法检查，配置未生效")
+    } else if output.contains(FORWARDING_RELOAD_FAILED_MARKER) {
+        bail!("sshd 配置已写入但重载失败，已恢复原配置")
+    } else if output.contains(FORWARDING_VERIFY_FAILED_MARKER) {
+        bail!("sshd 重载后配置校验失败，已恢复原配置")
+    } else {
+        bail!("远端未返回 sshd 配置结果")
+    }
+}
 
 pub struct TunnelHandle {
     stop: Arc<AtomicBool>,
@@ -152,8 +211,10 @@ pub fn enable_forwarding(jump_host: &JumpHost) -> Result<String> {
     // First authenticate as the normal service account, as required by the workflow.
     let session = connect(jump_host)?;
     let mut channel = session.channel_session().context("创建远端会话失败")?;
+    let mut pty_modes = PtyModes::new();
+    pty_modes.set_boolean(PtyModeOpcode::ECHO, false);
     channel
-        .request_pty("xterm", None, Some((120, 40, 0, 0)))
+        .request_pty("xterm", Some(pty_modes), Some((120, 40, 0, 0)))
         .context("申请远端终端失败")?;
     channel.shell().context("打开远端 shell 失败")?;
 
@@ -162,17 +223,40 @@ pub fn enable_forwarding(jump_host: &JumpHost) -> Result<String> {
     read_until(&mut channel, &["assword", "密码"], Duration::from_secs(10))?;
     writeln!(channel, "{}", jump_host.root_password)?;
     channel.flush()?;
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(300));
+
+    writeln!(
+        channel,
+        "if [ \"$(id -u)\" = 0 ]; then echo {ROOT_OK_MARKER}; else echo {ROOT_FAILED_MARKER}; fi"
+    )?;
+    channel.flush()?;
+    let root_output = read_until(
+        &mut channel,
+        &[ROOT_OK_MARKER, ROOT_FAILED_MARKER],
+        Duration::from_secs(10),
+    )?;
+    if !root_output.contains(ROOT_OK_MARKER) {
+        bail!("root 用户认证失败，未获得 root 权限");
+    }
 
     // Keep Match blocks intact: replace global forwarding options only, validate
-    // the candidate file, and restore the backup if service restart fails.
-    let command = r#"set -eu; C=/etc/ssh/sshd_config; B="$C.s-porter.bak.$(date +%Y%m%d%H%M%S)"; T=$(mktemp /etc/ssh/sshd_config.s-porter.XXXXXX); cp -p "$C" "$B"; awk 'BEGIN{m=0; added=0} /^[[:space:]]*Match[[:space:]]/{if(!added){print "AllowTcpForwarding yes"; print "DisableForwarding no"; print "PermitOpen any"; added=1} m=1} {k=tolower($1)} !m && (k=="allowtcpforwarding" || k=="disableforwarding" || k=="permitopen"){next} {print} END{if(!added){print "AllowTcpForwarding yes"; print "DisableForwarding no"; print "PermitOpen any"}}' "$C" > "$T"; chmod --reference="$C" "$T" 2>/dev/null || chmod 600 "$T"; chown --reference="$C" "$T" 2>/dev/null || true; if ! sshd -t -f "$T"; then rm -f "$T"; echo __S_PORTER_INVALID__; exit 1; fi; mv "$T" "$C"; restart_ssh(){ systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart; }; if ! restart_ssh; then cp -p "$B" "$C"; restart_ssh || true; echo __S_PORTER_ROLLED_BACK__; exit 1; fi; echo __S_PORTER_OK__"#;
-    writeln!(channel, "{command}")?;
+    // the candidate file, reload sshd without killing container PID 1, and
+    // restore the backup if reload or effective-config verification fails.
+    writeln!(channel, "{ENABLE_FORWARDING_COMMAND}")?;
     channel.flush()?;
-    let output = read_until(&mut channel, &["__S_PORTER_OK__"], Duration::from_secs(30))?;
+    let output = read_until(
+        &mut channel,
+        &[
+            FORWARDING_OK_MARKER,
+            FORWARDING_INVALID_MARKER,
+            FORWARDING_RELOAD_FAILED_MARKER,
+            FORWARDING_VERIFY_FAILED_MARKER,
+        ],
+        Duration::from_secs(30),
+    )?;
     writeln!(channel, "exit")?;
     channel.close().ok();
-    Ok(output)
+    forwarding_result(output)
 }
 
 pub(super) fn connect(jump_host: &JumpHost) -> Result<Session> {
@@ -403,5 +487,46 @@ mod tests {
         let request = http_connect_request("ssh.internal:22", &proxy);
         assert!(request.starts_with("CONNECT ssh.internal:22 HTTP/1.1\r\n"));
         assert!(request.contains("Proxy-Authorization: Basic YWxpY2U6cGFzc3dvcmQ=\r\n"));
+    }
+
+    #[test]
+    fn forwarding_command_reloads_and_verifies_effective_configuration() {
+        assert!(ENABLE_FORWARDING_COMMAND.contains("systemctl reload sshd"));
+        assert!(ENABLE_FORWARDING_COMMAND.contains("kill -HUP"));
+        assert!(ENABLE_FORWARDING_COMMAND.contains("sshd -T"));
+        assert!(!ENABLE_FORWARDING_COMMAND.contains("systemctl restart"));
+        assert!(!ENABLE_FORWARDING_COMMAND.contains(ROOT_OK_MARKER));
+    }
+
+    #[test]
+    fn forwarding_result_requires_the_real_success_marker() {
+        assert!(forwarding_result(FORWARDING_OK_MARKER.into()).is_ok());
+        assert!(forwarding_result(FORWARDING_INVALID_MARKER.into()).is_err());
+        assert!(forwarding_result(FORWARDING_RELOAD_FAILED_MARKER.into()).is_err());
+        assert!(forwarding_result(FORWARDING_VERIFY_FAILED_MARKER.into()).is_err());
+        assert!(forwarding_result("命令已发送".into()).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires docker-compose.test.yml services"]
+    fn enables_forwarding_in_the_local_docker_ssh_service() {
+        let host = JumpHost {
+            id: "docker-ssh".into(),
+            name: "Docker SSH".into(),
+            host: "127.0.0.1".into(),
+            port: 22,
+            username: "tester".into(),
+            password: "tester123".into(),
+            root_username: "root".into(),
+            root_password: "root123".into(),
+            http_proxy: Some(HttpProxyConfig {
+                host: "127.0.0.1".into(),
+                port: 8888,
+                username: "proxyuser".into(),
+                password: "proxypass".into(),
+            }),
+        };
+
+        enable_forwarding(&host).unwrap();
     }
 }

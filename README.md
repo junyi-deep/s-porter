@@ -24,27 +24,28 @@ cargo run
 
 ## 本地 Docker 测试环境
 
-启动用于联调的 SSH、Nginx 和 HTTP CONNECT 代理：
+启动用于联调的 SSH、Nginx 和 HTTP CONNECT 代理。SSH 与 Nginx
+不向宿主机暴露端口，只能通过 HTTP 代理访问：
 
 ```bash
 docker compose -f docker-compose.test.yml up -d --build
 ```
 
-直连跳板机配置：
-
-- SSH 地址：`127.0.0.1`
-- SSH 端口：`2222`
-- 登录用户/密码：`tester` / `tester123`
-- root 用户/密码：`root` / `root123`
-
 通过 HTTP 代理连接时：
 
-- SSH 地址/端口：`ssh` / `22`，也兼容直连配置 `127.0.0.1` / `2222`
+- SSH 地址/端口：`127.0.0.1` / `22`（也支持 `ssh` / `22`）
+- 登录用户/密码：`tester` / `tester123`
+- root 用户/密码：`root` / `root123`
 - HTTP 代理地址/端口：`127.0.0.1` / `8888`
 - 代理用户/密码：`proxyuser` / `proxypass`
 
-本地转发的远程目标可填写 `nginx:80`。Nginx 同时映射到宿主机
-`http://127.0.0.1:18080`，便于对照检查。停止环境：
+本地转发的远程目标可填写 `nginx:80`。也可以直接验证 Nginx 的代理访问：
+
+```bash
+curl --proxy http://proxyuser:proxypass@127.0.0.1:8888 http://nginx/
+```
+
+停止环境：
 
 ```bash
 docker compose -f docker-compose.test.yml down

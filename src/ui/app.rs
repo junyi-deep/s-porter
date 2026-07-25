@@ -31,7 +31,7 @@ use std::{
     rc::Rc,
 };
 
-const DEFAULT_UI_FONT_SIZE: f32 = 14.;
+const DEFAULT_UI_FONT_SIZE: f32 = 16.;
 pub(super) const UI_FONT_SIZES: [u8; 15] =
     [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
 
@@ -993,7 +993,7 @@ impl AppView {
             show_file_time: false,
             show_file_size: true,
             show_file_permissions: false,
-            terminal_font_size: None,
+            terminal_font_size: Some(12.0),
         });
         self.active_ssh_tab_id = Some(tab_id.clone());
         self.page = Page::Ssh;
@@ -1885,7 +1885,7 @@ impl AppView {
                 .spawn(async move {
                     if enable {
                         forward::enable_forwarding(&jump_host)
-                            .map(|_| "远端已允许 TCP 转发，sshd 已重启".to_string())
+                            .map(|_| "远端已允许 TCP 转发，sshd 已重载并验证生效".to_string())
                     } else {
                         forward::test_connection(&item, &jump_host)
                             .map(|_| "测试成功：SSH 登录及目标端口均可访问".to_string())
