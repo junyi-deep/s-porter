@@ -1,4 +1,6 @@
 use super::app::{AppView, SshConnectionState, SshTab, UI_FONT_SIZES};
+use gpui::InteractiveElement as _;
+use gpui::StatefulInteractiveElement as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -8,6 +10,7 @@ use gpui_component::{
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     resizable::{resizable_panel, v_resizable},
     scroll::ScrollableElement,
+    scroll::Scrollbar,
     text::{TextView, TextViewStyle},
     *,
 };
@@ -235,16 +238,6 @@ fn render_terminal(
         SshConnectionState::Connected => ("已断开", cx.theme().danger),
         SshConnectionState::Failed(_) => ("连接失败", cx.theme().danger),
     };
-    let output = tab
-        .terminal
-        .as_ref()
-        .map(|terminal| terminal.output())
-        .filter(|output| !output.is_empty())
-        .unwrap_or_else(|| match &tab.state {
-            SshConnectionState::Connecting => "正在建立 SSH 连接…".into(),
-            SshConnectionState::Failed(error) => format!("SSH 连接失败：{error}"),
-            SshConnectionState::Connected => "已连接，等待远端输出…".into(),
-        });
     let clear_view = view.clone();
     let reconnect_view = view.clone();
     let files_view = view.clone();
@@ -427,19 +420,33 @@ fn render_terminal(
                                 .p_3()
                                 .bg(gpui::rgb(0xffffff))
                                 .text_color(gpui::rgb(0x111827))
-                                .overflow_y_scrollbar()
                                 .child(
-                                    TextView::markdown(
-                                        format!("ssh-output-{}", tab.id),
-                                        format!("```text\n{output}\n```"),
-                                    )
-                                    .style(
-                                        TextViewStyle::default().code_block(
-                                            StyleRefinement::default()
-                                                .text_size(px(terminal_font_size)),
+                                    div()
+                                        .relative()
+                                        .size_full()
+                                        .child(
+                                            div()
+                                                .id(format!("ssh-terminal-scroll-{}", tab.id))
+                                                .size_full()
+                                                .overflow_y_scroll()
+                                                .track_scroll(&tab.terminal_scroll)
+                                                .child(
+                                                    TextView::new(&tab.terminal_view)
+                                                        .style(
+                                                            TextViewStyle::default().code_block(
+                                                                StyleRefinement::default()
+                                                                    .text_size(px(
+                                                                        terminal_font_size,
+                                                                    )),
+                                                            ),
+                                                        )
+                                                        .selectable(true),
+                                                ),
+                                        )
+                                        .child(
+                                            Scrollbar::vertical(&tab.terminal_scroll)
+                                                .id(format!("ssh-terminal-scrollbar-{}", tab.id)),
                                         ),
-                                    )
-                                    .selectable(true),
                                 )
                                 .into_any_element(),
                         ),

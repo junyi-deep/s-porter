@@ -16,7 +16,7 @@ use gpui_component::{
     notification::Notification,
     resizable::{h_resizable, resizable_panel},
     table::TableState,
-    text::TextView,
+    text::{TextView, TextViewState},
     *,
 };
 use lsp_types::{
@@ -144,6 +144,9 @@ pub(super) struct SshTab {
     pub(super) command: Entity<InputState>,
     pub(super) state: SshConnectionState,
     pub(super) terminal: Option<forward::SshTerminalHandle>,
+    pub(super) terminal_view: Entity<TextViewState>,
+    pub(super) terminal_scroll: ScrollHandle,
+    pub(super) terminal_output_revision: u64,
     pub(super) file_panel_open: bool,
     pub(super) remote_path: String,
     pub(super) remote_path_input: Entity<InputState>,
@@ -400,6 +403,20 @@ impl AppView {
                             cx.notify();
                         }
                     })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn_in(window, async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                if weak
+                    .update_in(cx, |this, _, cx| this.sync_active_ssh_output(cx))
                     .is_err()
                 {
                     break;
@@ -957,6 +974,9 @@ impl AppView {
         });
         let remote_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("输入远程路径"));
+        let terminal_view = cx.new(|cx| {
+            TextViewState::markdown("```text\n正在建立 SSH 连接…\n```", cx).selectable(true)
+        });
         let command_tab_id = tab_id.clone();
         let command_subscription =
             cx.subscribe_in(&command, window, move |this, _, event, window, cx| {
@@ -984,6 +1004,9 @@ impl AppView {
             command,
             state: SshConnectionState::Connecting,
             terminal: None,
+            terminal_view,
+            terminal_scroll: ScrollHandle::new(),
+            terminal_output_revision: 0,
             file_panel_open: false,
             remote_path: String::new(),
             remote_path_input,
@@ -1016,6 +1039,9 @@ impl AppView {
                     Err(error) => {
                         let message = format!("{error:#}");
                         tab.state = SshConnectionState::Failed(message.clone());
+                        tab.terminal_view.update(cx, |state, cx| {
+                            state.set_text(&format!("```text\nSSH 连接失败：{message}\n```"), cx)
+                        });
                         this.push_message(format!("SSH 连接失败：{message}"), window, cx);
                     }
                 }
@@ -1027,7 +1053,36 @@ impl AppView {
 
     pub(super) fn activate_ssh_tab(&mut self, id: String, cx: &mut Context<Self>) {
         self.active_ssh_tab_id = Some(id);
+        self.sync_active_ssh_output(cx);
         cx.notify();
+    }
+
+    fn sync_active_ssh_output(&mut self, cx: &mut Context<Self>) {
+        if self.page != Page::Ssh {
+            return;
+        }
+        let Some(active_id) = self.active_ssh_tab_id.as_deref() else {
+            return;
+        };
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == active_id) else {
+            return;
+        };
+        let Some(terminal) = tab.terminal.as_ref() else {
+            return;
+        };
+        let Some((revision, output)) = terminal.output_if_changed(tab.terminal_output_revision)
+        else {
+            return;
+        };
+        tab.terminal_output_revision = revision;
+        let markdown = if output.is_empty() {
+            "```text\n终端输出已清空\n```".to_string()
+        } else {
+            format!("```text\n{output}\n```")
+        };
+        tab.terminal_view
+            .update(cx, |state, cx| state.set_text(&markdown, cx));
+        tab.terminal_scroll.scroll_to_bottom();
     }
 
     pub(super) fn close_ssh_tab(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1062,6 +1117,7 @@ impl AppView {
             .and_then(|terminal| terminal.send_line(&command));
         match result {
             Ok(()) => {
+                self.ssh_tabs[tab_index].terminal_scroll.scroll_to_bottom();
                 self.ssh_tabs[tab_index]
                     .command
                     .update(cx, |input, cx| input.set_value("", window, cx));
@@ -1202,6 +1258,9 @@ impl AppView {
         if let Some(terminal) = &tab.terminal {
             terminal.clear_output();
         }
+        tab.terminal_view.update(cx, |state, cx| {
+            state.set_text("```text\n终端输出已清空\n```", cx)
+        });
         cx.notify();
     }
 
@@ -1225,6 +1284,10 @@ impl AppView {
         };
         tab.terminal = None;
         tab.state = SshConnectionState::Connecting;
+        tab.terminal_output_revision = 0;
+        tab.terminal_view.update(cx, |state, cx| {
+            state.set_text("```text\n正在重新建立 SSH 连接…\n```", cx)
+        });
         let title = tab.title.clone();
         let tab_id = id.to_string();
         self.push_message(format!("正在重连 {title}"), window, cx);
@@ -1245,6 +1308,9 @@ impl AppView {
                     Err(error) => {
                         let message = format!("{error:#}");
                         tab.state = SshConnectionState::Failed(message.clone());
+                        tab.terminal_view.update(cx, |state, cx| {
+                            state.set_text(&format!("```text\nSSH 重连失败：{message}\n```"), cx)
+                        });
                         this.push_message(format!("SSH 重连失败：{message}"), window, cx);
                     }
                 }
@@ -1977,13 +2043,41 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.set_rem_size(px(self.ui_font_size));
         let sidebar_collapsed = self.sidebar_collapsed;
         let ui_font_size = self.ui_font_size;
         let message_count = self.messages.len();
         let message_search = self.message_search.clone();
         let messages = self.messages.clone();
         let font_size_view = cx.entity();
+        let sidebar_content = if sidebar_collapsed {
+            None
+        } else {
+            Some(sidebar::render(self, cx).into_any_element())
+        };
+        let page_content = match self.page {
+            Page::JumpHosts => jump_host_page::render(self, cx),
+            Page::Ssh => ssh_page::render(self, cx),
+            Page::Forward => forward_page::render(self, cx),
+            Page::Crypto => tool_page::render(self, true, cx),
+            Page::Codec => tool_page::render(self, false, cx),
+            Page::Format => format_page::render(self, cx),
+            Page::Time => time_page::render(self, cx),
+        };
+        let main_content = div().size_full().min_w_0().child(page_content);
+        let main_layout = if let Some(sidebar_content) = sidebar_content {
+            h_resizable("main-layout")
+                .child(
+                    resizable_panel()
+                        .size(px(196.))
+                        .size_range(px(168.)..px(320.))
+                        .flex_none()
+                        .child(sidebar_content),
+                )
+                .child(resizable_panel().child(main_content))
+                .into_any_element()
+        } else {
+            main_content.into_any_element()
+        };
         v_flex()
             .size_full()
             .bg(cx.theme().background)
@@ -2083,30 +2177,7 @@ impl Render for AppView {
                         ),
                 ),
             )
-            .child(
-                div().flex_1().min_h_0().child(
-                    h_resizable("main-layout")
-                        .child(
-                            resizable_panel()
-                                .visible(!sidebar_collapsed)
-                                .size(px(196.))
-                                .size_range(px(168.)..px(320.))
-                                .flex_none()
-                                .child(sidebar::render(self, cx)),
-                        )
-                        .child(resizable_panel().child(div().size_full().min_w_0().child(
-                            match self.page {
-                                Page::JumpHosts => jump_host_page::render(self, cx),
-                                Page::Ssh => ssh_page::render(self, cx),
-                                Page::Forward => forward_page::render(self, cx),
-                                Page::Crypto => tool_page::render(self, true, cx),
-                                Page::Codec => tool_page::render(self, false, cx),
-                                Page::Format => format_page::render(self, cx),
-                                Page::Time => time_page::render(self, cx),
-                            },
-                        ))),
-                ),
-            )
+            .child(div().flex_1().min_h_0().child(main_layout))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
