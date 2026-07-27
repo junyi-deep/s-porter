@@ -5619,6 +5619,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "ssh2",
+ "unicode-width",
  "urlencoding",
  "uuid",
  "vt100",

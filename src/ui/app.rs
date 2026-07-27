@@ -11,27 +11,25 @@ use gpui::*;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
-    input::{CompletionProvider, Input, InputEvent, InputState, Rope, RopeExt},
+    input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel},
     table::TableState,
-    text::{TextView, TextViewState},
+    text::TextView,
     *,
-};
-use lsp_types::{
-    CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
-    TextEdit,
 };
 use std::time::Duration;
 use std::{
-    cell::RefCell,
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
+    sync::Arc,
 };
+use unicode_width::UnicodeWidthChar as _;
 
-const DEFAULT_UI_FONT_SIZE: f32 = 16.;
+const DEFAULT_UI_FONT_SIZE: f32 = 14.;
 pub(super) const UI_FONT_SIZES: [u8; 15] =
     [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
 
@@ -115,7 +113,7 @@ impl JumpHostForm {
                 })
             };
         Self {
-            name: input("", "例如：生产环境跳板机", cx),
+            name: input("", "例如：生产环境服务器", cx),
             host: input("", "SSH 服务器 IP 或域名", cx),
             port: input("22", "SSH 端口", cx),
             username: input("paas", "SSH 登录用户名", cx),
@@ -137,16 +135,78 @@ pub(super) enum SshConnectionState {
     Failed(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TransferDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum TransferStatus {
+    Running,
+    Cancelling,
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SshFilePanelView {
+    Files,
+    Transfers,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RemoteSortField {
+    Name,
+    Modified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TerminalSearchMatch {
+    pub(super) line: usize,
+    pub(super) range: std::ops::Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct TerminalPoint {
+    pub(super) line: usize,
+    pub(super) column: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TerminalSelection {
+    pub(super) anchor: TerminalPoint,
+    pub(super) cursor: TerminalPoint,
+}
+
+pub(super) struct SshTransfer {
+    pub(super) id: String,
+    pub(super) direction: TransferDirection,
+    pub(super) title: String,
+    pub(super) progress: forward::TransferProgress,
+    pub(super) status: TransferStatus,
+    pub(super) started_at: String,
+    pub(super) finished_at: Option<String>,
+}
+
 pub(super) struct SshTab {
     pub(super) id: String,
     pub(super) jump_host_id: String,
     pub(super) title: String,
-    pub(super) command: Entity<InputState>,
     pub(super) state: SshConnectionState,
     pub(super) terminal: Option<forward::SshTerminalHandle>,
-    pub(super) terminal_view: Entity<TextViewState>,
-    pub(super) terminal_scroll: ScrollHandle,
+    pub(super) terminal_lines: Arc<Vec<forward::TerminalLine>>,
+    pub(super) terminal_scroll: UniformListScrollHandle,
+    pub(super) terminal_focus: FocusHandle,
+    pub(super) terminal_size: Rc<Cell<(u16, u16)>>,
+    pub(super) terminal_content_left: Rc<Cell<f32>>,
     pub(super) terminal_output_revision: u64,
+    pub(super) terminal_selection: Option<TerminalSelection>,
+    pub(super) terminal_selecting: bool,
+    pub(super) terminal_search: Entity<InputState>,
+    pub(super) terminal_search_open: bool,
+    pub(super) terminal_search_index: Option<usize>,
     pub(super) file_panel_open: bool,
     pub(super) remote_path: String,
     pub(super) remote_path_input: Entity<InputState>,
@@ -156,7 +216,11 @@ pub(super) struct SshTab {
     pub(super) show_file_time: bool,
     pub(super) show_file_size: bool,
     pub(super) show_file_permissions: bool,
+    pub(super) remote_sort_field: RemoteSortField,
+    pub(super) remote_sort_ascending: bool,
     pub(super) terminal_font_size: Option<f32>,
+    pub(super) transfers: Vec<SshTransfer>,
+    pub(super) file_panel_view: SshFilePanelView,
 }
 
 pub(super) struct ToolInputs {
@@ -190,58 +254,209 @@ pub(super) struct AppMessage {
     pub(super) text: String,
 }
 
-#[derive(Clone)]
-struct CommandHistoryProvider {
-    history: Rc<RefCell<Vec<String>>>,
-}
-
 fn remember_command(history: &mut Vec<String>, command: &str) {
     history.retain(|existing| existing != command);
     history.insert(0, command.to_string());
     history.truncate(500);
 }
 
-impl CompletionProvider for CommandHistoryProvider {
-    fn completions(
-        &self,
-        text: &Rope,
-        _: usize,
-        _: CompletionContext,
-        _: &mut Window,
-        _: &mut Context<InputState>,
-    ) -> Task<anyhow::Result<CompletionResponse>> {
-        let query = text.to_string();
-        let query = query.trim().to_lowercase();
-        if query.is_empty() {
-            return Task::ready(Ok(CompletionResponse::Array(Vec::new())));
+fn terminal_byte_offset(text: &str, column: usize) -> usize {
+    let mut display_column = 0;
+    for (offset, character) in text.char_indices() {
+        if display_column >= column {
+            return offset;
         }
-        let range = lsp_types::Range::new(
-            text.offset_to_position(0),
-            text.offset_to_position(text.len()),
-        );
-        let items = self
-            .history
-            .borrow()
-            .iter()
-            .filter(|command| command.to_lowercase().contains(&query))
-            .take(12)
-            .map(|command| CompletionItem {
-                label: command.replace('\n', " ↵ "),
-                kind: Some(CompletionItemKind::TEXT),
-                detail: Some("历史命令".into()),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range,
-                    new_text: command.clone(),
-                })),
-                ..Default::default()
-            })
-            .collect();
-        Task::ready(Ok(CompletionResponse::Array(items)))
+        display_column += character.width().unwrap_or(1);
+    }
+    text.len()
+}
+
+fn terminal_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| character.width().unwrap_or(1))
+        .sum()
+}
+
+fn terminal_selected_text(
+    lines: &[forward::TerminalLine],
+    selection: TerminalSelection,
+) -> Option<String> {
+    let (start, end) = if selection.anchor <= selection.cursor {
+        (selection.anchor, selection.cursor)
+    } else {
+        (selection.cursor, selection.anchor)
+    };
+    if start == end || start.line >= lines.len() {
+        return None;
+    }
+    let end_line = end.line.min(lines.len().saturating_sub(1));
+    let mut selected = String::new();
+    for (line_index, line) in lines.iter().enumerate().take(end_line + 1).skip(start.line) {
+        let text = &line.text;
+        let start_column = if line_index == start.line {
+            start.column
+        } else {
+            0
+        };
+        let end_column = if line_index == end_line {
+            end.column
+        } else {
+            terminal_display_width(text)
+        };
+        let start_offset = terminal_byte_offset(text, start_column);
+        let end_offset = terminal_byte_offset(text, end_column);
+        if start_offset < end_offset {
+            selected.push_str(&text[start_offset..end_offset]);
+        }
+        if line_index < end_line {
+            selected.push('\n');
+        }
+    }
+    let selected = selected.replace('▏', "");
+    (!selected.is_empty()).then_some(selected)
+}
+
+pub(super) fn terminal_search_matches(
+    lines: &[forward::TerminalLine],
+    query: &str,
+) -> Vec<TerminalSearchMatch> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    lines
+        .iter()
+        .enumerate()
+        .flat_map(|(line, terminal_line)| {
+            terminal_line
+                .text
+                .to_lowercase()
+                .match_indices(&query)
+                .map(move |(start, value)| TerminalSearchMatch {
+                    line,
+                    range: start..start + value.len(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn terminal_modifier_code(modifiers: Modifiers) -> u8 {
+    1 + u8::from(modifiers.shift) + u8::from(modifiers.alt) * 2 + u8::from(modifiers.control) * 4
+}
+
+// Keyboard encoding follows the same xterm mappings used by Zed's terminal,
+// whose implementation is derived from Alacritty's terminal input mapping.
+fn terminal_key_bytes(
+    keystroke: &Keystroke,
+    application_cursor: bool,
+    prefer_character_input: bool,
+) -> Option<Vec<u8>> {
+    let modifiers = keystroke.modifiers;
+    if modifiers.platform {
+        return None;
+    }
+    if prefer_character_input {
+        return keystroke
+            .key_char
+            .as_deref()
+            .map(|value| value.as_bytes().to_vec());
     }
 
-    fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut Context<InputState>) -> bool {
-        !new_text.is_empty()
+    if modifiers.control && !modifiers.alt {
+        let key = keystroke.key.as_str();
+        let control = match key.to_ascii_lowercase().as_str() {
+            "space" | "@" => Some(0),
+            "[" => Some(27),
+            "\\" => Some(28),
+            "]" => Some(29),
+            "^" => Some(30),
+            "_" => Some(31),
+            "?" => Some(127),
+            value if value.len() == 1 => {
+                let byte = value.as_bytes()[0];
+                byte.is_ascii_lowercase().then_some(byte - b'a' + 1)
+            }
+            _ => None,
+        };
+        if let Some(control) = control {
+            return Some(vec![control]);
+        }
     }
+
+    let no_modifiers = !modifiers.control && !modifiers.alt && !modifiers.shift;
+    let cursor_prefix = if application_cursor { "\x1bO" } else { "\x1b[" };
+    let value = match keystroke.key.as_str() {
+        "tab" if modifiers.shift && !modifiers.control && !modifiers.alt => {
+            Some("\x1b[Z".to_string())
+        }
+        "tab" if no_modifiers => Some("\t".to_string()),
+        "escape" if no_modifiers => Some("\x1b".to_string()),
+        "enter" if no_modifiers => Some("\r".to_string()),
+        "enter" if modifiers.shift && !modifiers.control && !modifiers.alt => {
+            Some("\n".to_string())
+        }
+        "enter" if modifiers.alt && !modifiers.control => Some("\x1b\r".to_string()),
+        "backspace" if no_modifiers => Some("\x7f".to_string()),
+        "backspace" if modifiers.control && !modifiers.alt => Some("\x08".to_string()),
+        "backspace" if modifiers.alt && !modifiers.control => Some("\x1b\x7f".to_string()),
+        "up" if no_modifiers => Some(format!("{cursor_prefix}A")),
+        "down" if no_modifiers => Some(format!("{cursor_prefix}B")),
+        "right" if no_modifiers => Some(format!("{cursor_prefix}C")),
+        "left" if no_modifiers => Some(format!("{cursor_prefix}D")),
+        "home" if no_modifiers => Some(format!("{cursor_prefix}H")),
+        "end" if no_modifiers => Some(format!("{cursor_prefix}F")),
+        "insert" if no_modifiers => Some("\x1b[2~".to_string()),
+        "delete" if no_modifiers => Some("\x1b[3~".to_string()),
+        "pageup" if no_modifiers => Some("\x1b[5~".to_string()),
+        "pagedown" if no_modifiers => Some("\x1b[6~".to_string()),
+        "f1" if no_modifiers => Some("\x1bOP".to_string()),
+        "f2" if no_modifiers => Some("\x1bOQ".to_string()),
+        "f3" if no_modifiers => Some("\x1bOR".to_string()),
+        "f4" if no_modifiers => Some("\x1bOS".to_string()),
+        "f5" if no_modifiers => Some("\x1b[15~".to_string()),
+        "f6" if no_modifiers => Some("\x1b[17~".to_string()),
+        "f7" if no_modifiers => Some("\x1b[18~".to_string()),
+        "f8" if no_modifiers => Some("\x1b[19~".to_string()),
+        "f9" if no_modifiers => Some("\x1b[20~".to_string()),
+        "f10" if no_modifiers => Some("\x1b[21~".to_string()),
+        "f11" if no_modifiers => Some("\x1b[23~".to_string()),
+        "f12" if no_modifiers => Some("\x1b[24~".to_string()),
+        "up" | "down" | "right" | "left" | "home" | "end"
+            if modifiers.control || modifiers.alt || modifiers.shift =>
+        {
+            let suffix = match keystroke.key.as_str() {
+                "up" => 'A',
+                "down" => 'B',
+                "right" => 'C',
+                "left" => 'D',
+                "home" => 'H',
+                _ => 'F',
+            };
+            Some(format!(
+                "\x1b[1;{}{suffix}",
+                terminal_modifier_code(modifiers)
+            ))
+        }
+        _ => None,
+    };
+    if let Some(value) = value {
+        return Some(value.into_bytes());
+    }
+
+    let character = keystroke
+        .key_char
+        .as_deref()
+        .or_else(|| (keystroke.key.chars().count() == 1).then_some(keystroke.key.as_str()))?;
+    if modifiers.control {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(character.len() + usize::from(modifiers.alt));
+    if modifiers.alt {
+        bytes.push(0x1b);
+    }
+    bytes.extend_from_slice(character.as_bytes());
+    Some(bytes)
 }
 
 pub(super) struct AppView {
@@ -267,7 +482,6 @@ pub(super) struct AppView {
     pub(super) active_ssh_tab_id: Option<String>,
     pub(super) quick_commands: Vec<storage::QuickCommand>,
     pub(super) command_history: Vec<String>,
-    command_history_store: Rc<RefCell<Vec<String>>>,
     pub(super) crypto_tools: ToolInputs,
     pub(super) codec_tools: ToolInputs,
     pub(super) format_tools: format_page::FormatToolState,
@@ -288,13 +502,13 @@ impl AppView {
         Theme::global_mut(cx).font_size = px(DEFAULT_UI_FONT_SIZE);
         window.set_rem_size(px(DEFAULT_UI_FONT_SIZE));
         let forward_search = cx
-            .new(|cx| InputState::new(window, cx).placeholder("搜索名称、端口、远程目标或跳板机"));
+            .new(|cx| InputState::new(window, cx).placeholder("搜索名称、端口、远程目标或服务器"));
         let jump_host_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索名称、地址或登录用户"));
         let forward_host_picker_search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索跳板机"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索服务器"));
         let ssh_host_picker_search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索跳板机"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索服务器"));
         let message_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索最近 100 条消息"));
         let app_view = cx.entity();
@@ -354,7 +568,6 @@ impl AppView {
             .into_iter()
             .take(500)
             .collect::<Vec<_>>();
-        let command_history_store = Rc::new(RefCell::new(command_history.clone()));
         let view = Self {
             page: Page::JumpHosts,
             sidebar_collapsed: false,
@@ -378,7 +591,6 @@ impl AppView {
             active_ssh_tab_id: None,
             quick_commands: config.quick_commands,
             command_history,
-            command_history_store,
             crypto_tools: ToolInputs::new(window, cx),
             codec_tools: ToolInputs::new(window, cx),
             format_tools: format_page::FormatToolState::new(window, cx),
@@ -413,7 +625,7 @@ impl AppView {
         cx.spawn_in(window, async move |weak, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(500))
+                    .timer(Duration::from_millis(50))
                     .await;
                 if weak
                     .update_in(cx, |this, _, cx| this.sync_active_ssh_output(cx))
@@ -491,7 +703,7 @@ impl AppView {
             jump_host_id: self
                 .selected_jump_host_id
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("请先新增并选择跳板机"))?,
+                .ok_or_else(|| anyhow::anyhow!("请先新增并选择服务器"))?,
             keep_alive: self.form_keep_alive,
             keep_alive_interval_secs,
         };
@@ -500,7 +712,7 @@ impl AppView {
             self.jump_hosts
                 .iter()
                 .any(|host| host.id == config.jump_host_id),
-            "选择的跳板机不存在"
+            "选择的服务器不存在"
         );
         Ok(config)
     }
@@ -720,6 +932,51 @@ impl AppView {
         true
     }
 
+    pub(super) fn prepare_copy_jump_host(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(host) = self.jump_hosts.iter().find(|host| host.id == id).cloned() else {
+            return false;
+        };
+        let base_name = format!("{}_copy", host.name);
+        let mut copy_name = base_name.clone();
+        let mut suffix = 2;
+        while self.jump_hosts.iter().any(|host| host.name == copy_name) {
+            copy_name = format!("{base_name}_{suffix}");
+            suffix += 1;
+        }
+        let proxy = host.http_proxy.unwrap_or_default();
+        self.editing_jump_host_id = None;
+        self.jump_host_form_error = None;
+        let values = [
+            (&self.jump_host_form.name, copy_name),
+            (&self.jump_host_form.host, host.host),
+            (&self.jump_host_form.port, host.port.to_string()),
+            (&self.jump_host_form.username, host.username),
+            (&self.jump_host_form.password, host.password),
+            (&self.jump_host_form.root_username, host.root_username),
+            (&self.jump_host_form.root_password, host.root_password),
+            (&self.jump_host_form.proxy_host, proxy.host),
+            (
+                &self.jump_host_form.proxy_port,
+                if proxy.port > 0 {
+                    proxy.port.to_string()
+                } else {
+                    String::new()
+                },
+            ),
+            (&self.jump_host_form.proxy_username, proxy.username),
+            (&self.jump_host_form.proxy_password, proxy.password),
+        ];
+        for (input, value) in values {
+            Self::set_form_value(input, value, window, cx);
+        }
+        true
+    }
+
     fn jump_host_form_value(&self, cx: &App) -> anyhow::Result<JumpHost> {
         let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
         let proxy_host = value(&self.jump_host_form.proxy_host);
@@ -786,7 +1043,7 @@ impl AppView {
         self.jump_host_form_error = None;
         self.jump_hosts = next;
         self.selected_jump_host_id.get_or_insert(host.id);
-        self.push_message("跳板机配置已保存", window, cx);
+        self.push_message("服务器配置已保存", window, cx);
         cx.notify();
         true
     }
@@ -856,7 +1113,7 @@ impl AppView {
                 associated.join("\n")
             )
         };
-        let title = format!("确认删除跳板机“{}”？", host.name);
+        let title = format!("确认删除服务器“{}”？", host.name);
         let view = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let delete_id = id.clone();
@@ -932,7 +1189,7 @@ impl AppView {
         }
         self.push_message(
             format!(
-                "跳板机已删除，同时清理 {} 个本地转发和相关 SSH 连接",
+                "服务器已删除，同时清理 {} 个本地转发和相关 SSH 连接",
                 forward_ids.len()
             ),
             window,
@@ -954,37 +1211,13 @@ impl AppView {
             .find(|host| host.id == jump_host_id)
             .cloned()
         else {
-            self.push_message("跳板机配置不存在", window, cx);
+            self.push_message("服务器配置不存在", window, cx);
             return;
         };
         let tab_id = uuid::Uuid::new_v4().to_string();
-        let command = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(3)
-                .submit_on_enter(true)
-                .soft_wrap(true)
-                .placeholder("输入命令，Enter 执行，Shift+Enter 换行")
-        });
-        let history_provider = CommandHistoryProvider {
-            history: self.command_history_store.clone(),
-        };
-        command.update(cx, |input, _| {
-            input.lsp.completion_provider = Some(Rc::new(history_provider));
-        });
         let remote_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("输入远程路径"));
-        let terminal_view = cx.new(|cx| {
-            TextViewState::markdown("```text\n正在建立 SSH 连接…\n```", cx).selectable(true)
-        });
-        let command_tab_id = tab_id.clone();
-        let command_subscription =
-            cx.subscribe_in(&command, window, move |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                    this.send_ssh_command(&command_tab_id, window, cx);
-                }
-            });
-        self._subscriptions.push(command_subscription);
+        let terminal_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索终端内容"));
         let path_tab_id = tab_id.clone();
         let path_subscription = cx.subscribe_in(
             &remote_path_input,
@@ -997,26 +1230,64 @@ impl AppView {
             },
         );
         self._subscriptions.push(path_subscription);
+        let search_tab_id = tab_id.clone();
+        let search_subscription = cx.subscribe_in(
+            &terminal_search,
+            window,
+            move |this, _, event, window, cx| match event {
+                InputEvent::Change => {
+                    if let Some(tab) = this.ssh_tabs.iter_mut().find(|tab| tab.id == search_tab_id)
+                    {
+                        tab.terminal_search_index = None;
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { shift, .. } => {
+                    this.navigate_ssh_terminal_search(
+                        &search_tab_id,
+                        if *shift { -1 } else { 1 },
+                        window,
+                        cx,
+                    );
+                }
+                _ => {}
+            },
+        );
+        self._subscriptions.push(search_subscription);
         self.ssh_tabs.push(SshTab {
             id: tab_id.clone(),
             jump_host_id: host.id.clone(),
             title: host.name.clone(),
-            command,
             state: SshConnectionState::Connecting,
             terminal: None,
-            terminal_view,
-            terminal_scroll: ScrollHandle::new(),
+            terminal_lines: Arc::new(vec![forward::TerminalLine {
+                text: "正在建立 SSH 连接…".into(),
+                styles: Vec::new(),
+            }]),
+            terminal_scroll: UniformListScrollHandle::new(),
+            terminal_focus: cx.focus_handle().tab_stop(true),
+            terminal_size: Rc::new(Cell::new((120, 40))),
+            terminal_content_left: Rc::new(Cell::new(0.)),
             terminal_output_revision: 0,
+            terminal_selection: None,
+            terminal_selecting: false,
+            terminal_search,
+            terminal_search_open: false,
+            terminal_search_index: None,
             file_panel_open: false,
             remote_path: String::new(),
             remote_path_input,
             remote_entries: Vec::new(),
             file_loading: false,
             file_error: None,
-            show_file_time: false,
-            show_file_size: true,
+            show_file_time: true,
+            show_file_size: false,
             show_file_permissions: false,
-            terminal_font_size: Some(12.0),
+            remote_sort_field: RemoteSortField::Name,
+            remote_sort_ascending: true,
+            terminal_font_size: None,
+            transfers: Vec::new(),
+            file_panel_view: SshFilePanelView::Files,
         });
         self.active_ssh_tab_id = Some(tab_id.clone());
         self.page = Page::Ssh;
@@ -1035,13 +1306,15 @@ impl AppView {
                     Ok(terminal) => {
                         tab.terminal = Some(terminal);
                         tab.state = SshConnectionState::Connected;
+                        tab.terminal_focus.focus(window, cx);
                     }
                     Err(error) => {
                         let message = format!("{error:#}");
                         tab.state = SshConnectionState::Failed(message.clone());
-                        tab.terminal_view.update(cx, |state, cx| {
-                            state.set_text(&format!("```text\nSSH 连接失败：{message}\n```"), cx)
-                        });
+                        tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
+                            text: format!("SSH 连接失败：{message}"),
+                            styles: Vec::new(),
+                        }]);
                         this.push_message(format!("SSH 连接失败：{message}"), window, cx);
                     }
                 }
@@ -1075,17 +1348,32 @@ impl AppView {
             return;
         };
         tab.terminal_output_revision = revision;
-        let markdown = if output.is_empty() {
-            "```text\n终端输出已清空\n```".to_string()
+        tab.terminal_lines = if output.is_empty() {
+            Arc::new(vec![forward::TerminalLine {
+                text: "终端输出已清空".into(),
+                styles: Vec::new(),
+            }])
         } else {
-            format!("```text\n{output}\n```")
+            Arc::new(output)
         };
-        tab.terminal_view
-            .update(cx, |state, cx| state.set_text(&markdown, cx));
-        tab.terminal_scroll.scroll_to_bottom();
+        tab.terminal_scroll.scroll_to_item_strict(
+            tab.terminal_lines.len().saturating_sub(1),
+            ScrollStrategy::Bottom,
+        );
+        cx.notify();
     }
 
     pub(super) fn close_ssh_tab(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(tab) = self.ssh_tabs.iter().find(|tab| tab.id == id) {
+            for transfer in &tab.transfers {
+                if matches!(
+                    transfer.status,
+                    TransferStatus::Running | TransferStatus::Cancelling
+                ) {
+                    transfer.progress.cancel();
+                }
+            }
+        }
         self.ssh_tabs.retain(|tab| tab.id != id);
         if self.active_ssh_tab_id.as_deref() == Some(id) {
             self.active_ssh_tab_id = self.ssh_tabs.last().map(|tab| tab.id.clone());
@@ -1093,20 +1381,16 @@ impl AppView {
         cx.notify();
     }
 
-    pub(super) fn send_ssh_command(
+    pub(super) fn run_ssh_quick_command(
         &mut self,
         id: &str,
+        command: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(tab_index) = self.ssh_tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
-        let command = self.ssh_tabs[tab_index]
-            .command
-            .read(cx)
-            .value()
-            .to_string();
         if command.trim().is_empty() {
             return;
         }
@@ -1114,17 +1398,183 @@ impl AppView {
             .terminal
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("SSH 尚未连接"))
-            .and_then(|terminal| terminal.send_line(&command));
+            .and_then(|terminal| terminal.send_line(command));
         match result {
             Ok(()) => {
-                self.ssh_tabs[tab_index].terminal_scroll.scroll_to_bottom();
-                self.ssh_tabs[tab_index]
-                    .command
-                    .update(cx, |input, cx| input.set_value("", window, cx));
                 self.record_command_history(command.trim_end(), window, cx);
+                self.ssh_tabs[tab_index].terminal_focus.focus(window, cx);
             }
             Err(error) => self.push_message(error.to_string(), window, cx),
         }
+    }
+
+    pub(super) fn send_ssh_keystroke(
+        &mut self,
+        id: &str,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let copy_shortcut = if cfg!(target_os = "macos") {
+            event.keystroke.modifiers.platform
+                && !event.keystroke.modifiers.control
+                && event.keystroke.key.eq_ignore_ascii_case("c")
+        } else {
+            event.keystroke.modifiers.control
+                && event.keystroke.modifiers.shift
+                && event.keystroke.key.eq_ignore_ascii_case("c")
+        };
+        if copy_shortcut && self.copy_ssh_terminal_selection(id, cx) {
+            return true;
+        }
+        let Some(tab) = self.ssh_tabs.iter().find(|tab| tab.id == id) else {
+            return false;
+        };
+        let Some(terminal) = tab.terminal.as_ref() else {
+            return false;
+        };
+        let paste_shortcut = if cfg!(target_os = "macos") {
+            event.keystroke.modifiers.platform
+                && !event.keystroke.modifiers.control
+                && event.keystroke.key.eq_ignore_ascii_case("v")
+        } else {
+            event.keystroke.modifiers.control
+                && event.keystroke.modifiers.shift
+                && event.keystroke.key.eq_ignore_ascii_case("v")
+        };
+        if paste_shortcut {
+            let Some(text) = cx
+                .read_from_clipboard()
+                .and_then(|clipboard| clipboard.text())
+            else {
+                return true;
+            };
+            if let Err(error) = terminal.send_paste(&text) {
+                self.push_message(format!("SSH 粘贴失败：{error:#}"), window, cx);
+            }
+            return true;
+        }
+        let Some(bytes) = terminal_key_bytes(
+            &event.keystroke,
+            terminal.application_cursor(),
+            event.prefer_character_input,
+        ) else {
+            return false;
+        };
+        if let Err(error) = terminal.send_bytes(bytes) {
+            self.push_message(format!("SSH 输入失败：{error:#}"), window, cx);
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn begin_ssh_terminal_selection(
+        &mut self,
+        id: &str,
+        line: usize,
+        column: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let point = TerminalPoint { line, column };
+        tab.terminal_selection = Some(TerminalSelection {
+            anchor: point,
+            cursor: point,
+        });
+        tab.terminal_selecting = true;
+        cx.notify();
+    }
+
+    pub(super) fn update_ssh_terminal_selection(
+        &mut self,
+        id: &str,
+        line: usize,
+        column: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self
+            .ssh_tabs
+            .iter_mut()
+            .find(|tab| tab.id == id && tab.terminal_selecting)
+        else {
+            return;
+        };
+        if let Some(selection) = &mut tab.terminal_selection {
+            selection.cursor = TerminalPoint { line, column };
+            cx.notify();
+        }
+    }
+
+    pub(super) fn finish_ssh_terminal_selection(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        tab.terminal_selecting = false;
+        cx.notify();
+    }
+
+    pub(super) fn copy_ssh_terminal_selection(&self, id: &str, cx: &mut Context<Self>) -> bool {
+        let Some(tab) = self.ssh_tabs.iter().find(|tab| tab.id == id) else {
+            return false;
+        };
+        let Some(selection) = tab.terminal_selection else {
+            return false;
+        };
+        let Some(text) = terminal_selected_text(&tab.terminal_lines, selection) else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    pub(super) fn toggle_ssh_terminal_search(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        tab.terminal_search_open = !tab.terminal_search_open;
+        if tab.terminal_search_open {
+            tab.terminal_search
+                .update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            tab.terminal_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn navigate_ssh_terminal_search(
+        &mut self,
+        id: &str,
+        direction: i32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let query = tab.terminal_search.read(cx).value().to_string();
+        let matches = terminal_search_matches(&tab.terminal_lines, &query);
+        if matches.is_empty() {
+            tab.terminal_search_index = None;
+            cx.notify();
+            return;
+        }
+        let next = match (tab.terminal_search_index, direction.is_negative()) {
+            (None, false) => 0,
+            (None, true) => matches.len() - 1,
+            (Some(current), false) => (current + 1) % matches.len(),
+            (Some(current), true) => current.checked_sub(1).unwrap_or(matches.len() - 1),
+        };
+        tab.terminal_search_index = Some(next);
+        tab.terminal_scroll
+            .scroll_to_item(matches[next].line, ScrollStrategy::Center);
+        cx.notify();
     }
 
     fn record_command_history(
@@ -1134,37 +1584,9 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         remember_command(&mut self.command_history, command);
-        *self.command_history_store.borrow_mut() = self.command_history.clone();
         if let Err(error) = self.persist() {
             self.push_message(format!("历史命令保存失败：{error:#}"), window, cx);
         }
-    }
-
-    pub(super) fn fill_ssh_command(
-        &mut self,
-        id: &str,
-        command: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(tab) = self.ssh_tabs.iter().find(|tab| tab.id == id) else {
-            return;
-        };
-        let input = tab.command.clone();
-        let line = command.matches('\n').count() as u32;
-        let column = command
-            .rsplit_once('\n')
-            .map(|(_, line)| line.chars().count())
-            .unwrap_or_else(|| command.chars().count()) as u32;
-        input.update(cx, |input, cx| {
-            input.set_value(command, window, cx);
-            input.set_cursor_position(
-                gpui_component::input::Position::new(line, column),
-                window,
-                cx,
-            );
-        });
-        cx.notify();
     }
 
     pub(super) fn set_ssh_terminal_font_size(
@@ -1247,20 +1669,19 @@ impl AppView {
     pub(super) fn clear_ssh_terminal(
         &mut self,
         id: &str,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
             return;
         };
-        tab.command
-            .update(cx, |input, cx| input.set_value("", window, cx));
         if let Some(terminal) = &tab.terminal {
             terminal.clear_output();
         }
-        tab.terminal_view.update(cx, |state, cx| {
-            state.set_text("```text\n终端输出已清空\n```", cx)
-        });
+        tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
+            text: "终端输出已清空".into(),
+            styles: Vec::new(),
+        }]);
         cx.notify();
     }
 
@@ -1279,15 +1700,17 @@ impl AppView {
             .find(|host| host.id == tab.jump_host_id)
             .cloned()
         else {
-            self.push_message("跳板机配置不存在，无法重连", window, cx);
+            self.push_message("服务器配置不存在，无法重连", window, cx);
             return;
         };
         tab.terminal = None;
         tab.state = SshConnectionState::Connecting;
+        tab.terminal_size.set((0, 0));
         tab.terminal_output_revision = 0;
-        tab.terminal_view.update(cx, |state, cx| {
-            state.set_text("```text\n正在重新建立 SSH 连接…\n```", cx)
-        });
+        tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
+            text: "正在重新建立 SSH 连接…".into(),
+            styles: Vec::new(),
+        }]);
         let title = tab.title.clone();
         let tab_id = id.to_string();
         self.push_message(format!("正在重连 {title}"), window, cx);
@@ -1304,13 +1727,15 @@ impl AppView {
                     Ok(terminal) => {
                         tab.terminal = Some(terminal);
                         tab.state = SshConnectionState::Connected;
+                        tab.terminal_focus.focus(window, cx);
                     }
                     Err(error) => {
                         let message = format!("{error:#}");
                         tab.state = SshConnectionState::Failed(message.clone());
-                        tab.terminal_view.update(cx, |state, cx| {
-                            state.set_text(&format!("```text\nSSH 重连失败：{message}\n```"), cx)
-                        });
+                        tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
+                            text: format!("SSH 重连失败：{message}"),
+                            styles: Vec::new(),
+                        }]);
                         this.push_message(format!("SSH 重连失败：{message}"), window, cx);
                     }
                 }
@@ -1353,7 +1778,7 @@ impl AppView {
             .find(|host| host.id == tab.jump_host_id)
             .cloned()
         else {
-            self.push_message("跳板机配置不存在，无法读取文件", window, cx);
+            self.push_message("服务器配置不存在，无法读取文件", window, cx);
             return;
         };
         tab.file_loading = true;
@@ -1410,6 +1835,35 @@ impl AppView {
             "permissions" => tab.show_file_permissions = !tab.show_file_permissions,
             _ => return,
         }
+        cx.notify();
+    }
+
+    pub(super) fn sort_ssh_remote_entries(
+        &mut self,
+        id: &str,
+        field: RemoteSortField,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        if tab.remote_sort_field == field {
+            tab.remote_sort_ascending = !tab.remote_sort_ascending;
+        } else {
+            tab.remote_sort_field = field;
+            tab.remote_sort_ascending = true;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_ssh_file_panel_view(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        tab.file_panel_view = match tab.file_panel_view {
+            SshFilePanelView::Files => SshFilePanelView::Transfers,
+            SshFilePanelView::Transfers => SshFilePanelView::Files,
+        };
         cx.notify();
     }
 
@@ -1493,7 +1947,7 @@ impl AppView {
             .find(|host| host.id == tab.jump_host_id)
             .cloned()
         else {
-            self.push_message("跳板机配置不存在，无法新建文件", window, cx);
+            self.push_message("服务器配置不存在，无法新建文件", window, cx);
             return;
         };
         let remote_dir = if tab.remote_path.is_empty() {
@@ -1539,6 +1993,110 @@ impl AppView {
         .detach();
     }
 
+    pub(super) fn confirm_delete_ssh_entry(
+        &mut self,
+        id: &str,
+        entry: forward::RemoteEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if entry.name == ".." {
+            return;
+        }
+        let view = cx.entity();
+        let tab_id = id.to_string();
+        let kind = if entry.is_dir { "文件夹" } else { "文件" };
+        let warning = if entry.is_dir {
+            format!(
+                "确定删除远程文件夹“{}”吗？文件夹及其全部内容都会被删除，此操作无法撤销。",
+                entry.name
+            )
+        } else {
+            format!("确定删除远程文件“{}”吗？此操作无法撤销。", entry.name)
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            let delete_view = view.clone();
+            let delete_id = tab_id.clone();
+            let delete_entry = entry.clone();
+            dialog
+                .title(format!("删除{kind}"))
+                .w(px(460.))
+                .child(div().text_sm().child(warning.clone()))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("cancel-delete-remote").outline().label("取消")),
+                        )
+                        .child(
+                            Button::new("confirm-delete-remote")
+                                .danger()
+                                .label("确认删除")
+                                .on_click(move |_, window, cx| {
+                                    delete_view.update(cx, |this, cx| {
+                                        this.delete_ssh_entry(
+                                            &delete_id,
+                                            delete_entry.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn delete_ssh_entry(
+        &mut self,
+        id: &str,
+        entry: forward::RemoteEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let Some(host) = self
+            .jump_hosts
+            .iter()
+            .find(|host| host.id == tab.jump_host_id)
+            .cloned()
+        else {
+            self.push_message("跳板机配置不存在，无法删除远程文件", window, cx);
+            return;
+        };
+        let remote_dir = tab.remote_path.clone();
+        tab.file_loading = true;
+        tab.file_error = None;
+        let tab_id = id.to_string();
+        let entry_name = entry.name.clone();
+        let entry_path = entry.path.clone();
+        let is_dir = entry.is_dir;
+        cx.notify();
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { forward::delete_entry(&host, &entry_path, is_dir) })
+                .await;
+            let _ = weak.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    this.push_message(format!("已删除远程项目：{entry_name}"), window, cx);
+                    this.load_ssh_directory(&tab_id, &remote_dir, window, cx);
+                }
+                Err(error) => {
+                    if let Some(tab) = this.ssh_tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                        tab.file_loading = false;
+                    }
+                    this.push_message(format!("删除远程项目失败：{error:#}"), window, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn prompt_ssh_upload(
         &mut self,
         id: &str,
@@ -1570,9 +2128,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.ssh_tabs.iter().find(|tab| tab.id == id) else {
+        let Some(tab_index) = self.ssh_tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
+        let tab = &self.ssh_tabs[tab_index];
         let Some(host) = self
             .jump_hosts
             .iter()
@@ -1587,6 +2146,31 @@ impl AppView {
         } else {
             tab.remote_path.clone()
         };
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let progress = forward::TransferProgress::default();
+        let mut names = paths
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("、");
+        if paths.len() > 3 {
+            names = format!("{names} 等 {} 项", paths.len());
+        }
+        self.ssh_tabs[tab_index].transfers.insert(
+            0,
+            SshTransfer {
+                id: transfer_id.clone(),
+                direction: TransferDirection::Upload,
+                title: names,
+                progress: progress.clone(),
+                status: TransferStatus::Running,
+                started_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                finished_at: None,
+            },
+        );
+        self.ssh_tabs[tab_index].file_panel_view = SshFilePanelView::Transfers;
         self.push_message(
             format!("正在上传 {} 个项目到 {}", paths.len(), remote_dir),
             window,
@@ -1594,17 +2178,55 @@ impl AppView {
         );
         cx.spawn_in(window, async move |weak, cx| {
             let remote_dir_for_upload = remote_dir.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { forward::upload(&host, &remote_dir_for_upload, &paths) })
-                .await;
-            let _ = weak.update_in(cx, |this, window, cx| match result {
-                Ok(count) => {
-                    this.push_message(format!("上传完成：{count} 个文件"), window, cx);
-                    this.load_ssh_directory(&tab_id, &remote_dir, window, cx);
+            let task_progress = progress.clone();
+            let worker = std::thread::Builder::new()
+                .name("s-porter-sftp-upload".into())
+                .spawn(move || {
+                    forward::upload(&host, &remote_dir_for_upload, &paths, &task_progress)
+                });
+            let result = match worker {
+                Ok(worker) => {
+                    while !worker.is_finished() {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                        let _ = weak.update_in(cx, |_, _, cx| cx.notify());
+                    }
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("上传线程意外终止")))
                 }
-                Err(error) => {
-                    this.push_message(format!("上传失败：{error:#}"), window, cx);
+                Err(error) => Err(anyhow::Error::new(error).context("无法启动上传线程")),
+            };
+            let _ = weak.update_in(cx, |this, window, cx| {
+                let cancelled = progress.is_cancelled();
+                if let Some(transfer) = this
+                    .ssh_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+                    .and_then(|tab| {
+                        tab.transfers
+                            .iter_mut()
+                            .find(|transfer| transfer.id == transfer_id)
+                    })
+                {
+                    transfer.finished_at =
+                        Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                    transfer.status = match &result {
+                        Ok(_) => TransferStatus::Completed,
+                        Err(_) if cancelled => TransferStatus::Cancelled,
+                        Err(error) => TransferStatus::Failed(format!("{error:#}")),
+                    };
+                }
+                match result {
+                    Ok(count) => {
+                        this.push_message(format!("上传完成：{count} 个文件"), window, cx);
+                        this.load_ssh_directory(&tab_id, &remote_dir, window, cx);
+                    }
+                    Err(_) if cancelled => this.push_message("上传已取消", window, cx),
+                    Err(error) => {
+                        this.push_message(format!("上传失败：{error:#}"), window, cx);
+                    }
                 }
             });
         })
@@ -1669,9 +2291,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.ssh_tabs.iter().find(|tab| tab.id == id) else {
+        let Some(tab_index) = self.ssh_tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
+        let tab = &self.ssh_tabs[tab_index];
         let Some(host) = self
             .jump_hosts
             .iter()
@@ -1680,27 +2303,91 @@ impl AppView {
         else {
             return;
         };
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let progress = forward::TransferProgress::default();
+        self.ssh_tabs[tab_index].transfers.insert(
+            0,
+            SshTransfer {
+                id: transfer_id.clone(),
+                direction: TransferDirection::Download,
+                title: entry.name.clone(),
+                progress: progress.clone(),
+                status: TransferStatus::Running,
+                started_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                finished_at: None,
+            },
+        );
+        self.ssh_tabs[tab_index].file_panel_view = SshFilePanelView::Transfers;
         self.push_message(format!("正在下载 {}", entry.name), window, cx);
+        let tab_id = id.to_string();
         cx.spawn_in(window, async move |weak, cx| {
+            let task_progress = progress.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    forward::download(&host, &entry.path, entry.is_dir, &target)
+                    forward::download(&host, &entry.path, entry.is_dir, &target, &task_progress)
                         .map(|count| (count, target))
                 })
                 .await;
-            let _ = weak.update_in(cx, |this, window, cx| match result {
-                Ok((count, target)) => this.push_message(
-                    format!("下载完成：{count} 个文件，保存到 {}", target.display()),
-                    window,
-                    cx,
-                ),
-                Err(error) => {
-                    this.push_message(format!("下载失败：{error:#}"), window, cx);
+            let _ = weak.update_in(cx, |this, window, cx| {
+                let cancelled = progress.is_cancelled();
+                if let Some(transfer) = this
+                    .ssh_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+                    .and_then(|tab| {
+                        tab.transfers
+                            .iter_mut()
+                            .find(|transfer| transfer.id == transfer_id)
+                    })
+                {
+                    transfer.finished_at =
+                        Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                    transfer.status = match &result {
+                        Ok(_) => TransferStatus::Completed,
+                        Err(_) if cancelled => TransferStatus::Cancelled,
+                        Err(error) => TransferStatus::Failed(format!("{error:#}")),
+                    };
+                }
+                match result {
+                    Ok((count, target)) => this.push_message(
+                        format!("下载完成：{count} 个文件，保存到 {}", target.display()),
+                        window,
+                        cx,
+                    ),
+                    Err(_) if cancelled => this.push_message("下载已取消", window, cx),
+                    Err(error) => {
+                        this.push_message(format!("下载失败：{error:#}"), window, cx);
+                    }
                 }
             });
         })
         .detach();
+    }
+
+    pub(super) fn cancel_ssh_transfer(
+        &mut self,
+        tab_id: &str,
+        transfer_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(transfer) = self
+            .ssh_tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| {
+                tab.transfers
+                    .iter_mut()
+                    .find(|transfer| transfer.id == transfer_id)
+            })
+        else {
+            return;
+        };
+        if transfer.status == TransferStatus::Running {
+            transfer.progress.cancel();
+            transfer.status = TransferStatus::Cancelling;
+            cx.notify();
+        }
     }
 
     pub(super) fn toggle_selected(&mut self, id: &str, selected: bool, cx: &mut Context<Self>) {
@@ -1786,7 +2473,7 @@ impl AppView {
             .find(|host| host.id == item.jump_host_id)
             .cloned()
         else {
-            self.push_message("关联的跳板机配置不存在", window, cx);
+            self.push_message("关联的服务器配置不存在", window, cx);
             return;
         };
         let id = id.to_string();
@@ -1925,7 +2612,7 @@ impl AppView {
             .cloned()
         else {
             self.busy = false;
-            self.push_message("关联的跳板机配置不存在", window, cx);
+            self.push_message("关联的服务器配置不存在", window, cx);
             return;
         };
         self.startup_logs
@@ -2186,7 +2873,12 @@ impl Render for AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::remember_command;
+    use super::{
+        TerminalPoint, TerminalSelection, remember_command, terminal_key_bytes,
+        terminal_search_matches, terminal_selected_text,
+    };
+    use crate::forward::TerminalLine;
+    use gpui::Keystroke;
 
     #[test]
     fn command_history_is_recent_deduplicated_and_bounded() {
@@ -2207,5 +2899,72 @@ mod tests {
         remember_command(&mut history, "new-command");
         assert_eq!(history.len(), 500);
         assert_eq!(history[0], "new-command");
+    }
+
+    #[test]
+    fn terminal_keys_encode_control_and_full_screen_navigation() {
+        assert_eq!(
+            terminal_key_bytes(&Keystroke::parse("ctrl-c").unwrap(), false, false),
+            Some(vec![0x03])
+        );
+        assert_eq!(
+            terminal_key_bytes(&Keystroke::parse("escape").unwrap(), false, false),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
+            terminal_key_bytes(&Keystroke::parse("up").unwrap(), false, false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            terminal_key_bytes(&Keystroke::parse("up").unwrap(), true, false),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            terminal_key_bytes(&Keystroke::parse("ctrl-d").unwrap(), false, false),
+            Some(vec![0x04])
+        );
+    }
+
+    #[test]
+    fn terminal_selection_copies_across_lines_without_the_visual_cursor() {
+        let lines = vec![
+            TerminalLine {
+                text: "alpha".into(),
+                styles: Vec::new(),
+            },
+            TerminalLine {
+                text: "be▏ta".into(),
+                styles: Vec::new(),
+            },
+        ];
+        let selection = TerminalSelection {
+            anchor: TerminalPoint { line: 0, column: 2 },
+            cursor: TerminalPoint { line: 1, column: 5 },
+        };
+
+        assert_eq!(
+            terminal_selected_text(&lines, selection).as_deref(),
+            Some("pha\nbeta")
+        );
+    }
+
+    #[test]
+    fn terminal_search_finds_all_case_insensitive_matches() {
+        let lines = vec![
+            TerminalLine {
+                text: "Ready then READY".into(),
+                styles: Vec::new(),
+            },
+            TerminalLine {
+                text: "not here".into(),
+                styles: Vec::new(),
+            },
+        ];
+
+        let matches = terminal_search_matches(&lines, "ready");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].line, 0);
+        assert_eq!(matches[0].range, 0..5);
+        assert_eq!(matches[1].range, 11..16);
     }
 }

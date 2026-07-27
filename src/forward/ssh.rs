@@ -466,7 +466,10 @@ fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, message: String) {
         if logs.len() >= MAX_LOG_LINES {
             logs.pop_front();
         }
-        logs.push_back(message);
+        logs.push_back(format!(
+            "[{}] {message}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ));
     }
 }
 
@@ -474,6 +477,19 @@ fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, message: String) {
 mod tests {
     use super::*;
     use crate::forward::HttpProxyConfig;
+
+    #[test]
+    fn tunnel_logs_include_local_time() {
+        let logs = Arc::new(Mutex::new(VecDeque::new()));
+        push_log(&logs, "started".into());
+        let value = logs.lock().unwrap().front().cloned().unwrap();
+
+        assert_eq!(value.len(), "[0000-00-00 00:00:00] started".len());
+        assert!(value.ends_with("] started"));
+        assert_eq!(&value[0..1], "[");
+        assert_eq!(&value[5..6], "-");
+        assert_eq!(&value[14..15], ":");
+    }
 
     #[test]
     fn http_proxy_request_has_connect_target_and_basic_auth() {

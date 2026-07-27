@@ -1,4 +1,7 @@
-use super::app::{AppView, SshConnectionState, SshTab, UI_FONT_SIZES};
+use super::app::{
+    AppView, RemoteSortField, SshConnectionState, SshFilePanelView, SshTab, TerminalSelection,
+    TransferDirection, TransferStatus, UI_FONT_SIZES,
+};
 use gpui::InteractiveElement as _;
 use gpui::StatefulInteractiveElement as _;
 use gpui::prelude::FluentBuilder as _;
@@ -8,13 +11,14 @@ use gpui_component::{
     dialog::{DialogClose, DialogFooter},
     input::{Input, InputState},
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
-    resizable::{resizable_panel, v_resizable},
-    scroll::ScrollableElement,
-    scroll::Scrollbar,
-    text::{TextView, TextViewStyle},
+    progress::Progress,
+    resizable::{h_resizable, resizable_panel},
+    scroll::{ScrollableElement, Scrollbar, ScrollbarShow},
+    tooltip::Tooltip,
     *,
 };
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthChar as _;
 
 fn open_quick_command_dialog(
     view: Entity<AppView>,
@@ -131,7 +135,7 @@ fn open_connection_dialog(
 ) {
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
-            .title("选择跳板机")
+            .title("选择服务器")
             .w(px(440.))
             .content({
                 let view = view.clone();
@@ -221,6 +225,88 @@ fn render_tabs(
         .into_any_element()
 }
 
+fn terminal_rgb(color: [u8; 3]) -> Hsla {
+    rgb((u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2])).into()
+}
+
+fn terminal_highlight(style: crate::forward::TerminalTextStyle) -> HighlightStyle {
+    let default_foreground = Some(rgb(0x111827).into());
+    let default_background = Some(rgb(0xffffff).into());
+    let (color, background_color) = if style.inverse {
+        (
+            style.background.map(terminal_rgb).or(default_background),
+            style.foreground.map(terminal_rgb).or(default_foreground),
+        )
+    } else {
+        (
+            style.foreground.map(terminal_rgb),
+            style.background.map(terminal_rgb),
+        )
+    };
+    HighlightStyle {
+        color,
+        background_color,
+        font_weight: style.bold.then_some(FontWeight::BOLD),
+        font_style: style.italic.then_some(FontStyle::Italic),
+        underline: style.underline.then_some(UnderlineStyle {
+            thickness: px(1.),
+            color,
+            wavy: false,
+        }),
+        fade_out: style.dim.then_some(0.45),
+        ..HighlightStyle::default()
+    }
+}
+
+fn terminal_byte_offset(text: &str, column: usize) -> usize {
+    let mut display_column = 0;
+    for (offset, character) in text.char_indices() {
+        if display_column >= column {
+            return offset;
+        }
+        display_column += character.width().unwrap_or(1);
+    }
+    text.len()
+}
+
+fn terminal_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| character.width().unwrap_or(1))
+        .sum()
+}
+
+fn terminal_selection_range(
+    line_index: usize,
+    text: &str,
+    selection: Option<TerminalSelection>,
+) -> Option<std::ops::Range<usize>> {
+    let selection = selection?;
+    let (start, end) = if selection.anchor <= selection.cursor {
+        (selection.anchor, selection.cursor)
+    } else {
+        (selection.cursor, selection.anchor)
+    };
+    if line_index < start.line || line_index > end.line {
+        return None;
+    }
+    let start_column = if line_index == start.line {
+        start.column
+    } else {
+        0
+    };
+    let end_column = if line_index == end.line {
+        end.column
+    } else {
+        terminal_display_width(text)
+    };
+    let range = terminal_byte_offset(text, start_column)..terminal_byte_offset(text, end_column);
+    (!range.is_empty()).then_some(range)
+}
+
+fn terminal_column(position_x: Pixels, content_left: f32, font_size: f32) -> usize {
+    ((f32::from(position_x) - content_left - 8.).max(0.) / (font_size * 0.62)).floor() as usize
+}
+
 fn render_terminal(
     tab: &SshTab,
     quick_commands: &[crate::storage::QuickCommand],
@@ -241,13 +327,57 @@ fn render_terminal(
     let clear_view = view.clone();
     let reconnect_view = view.clone();
     let files_view = view.clone();
+    let search_view = view.clone();
+    let search_previous_view = view.clone();
+    let search_next_view = view.clone();
     let clear_id = tab.id.clone();
     let reconnect_id = tab.id.clone();
     let files_id = tab.id.clone();
+    let search_id = tab.id.clone();
+    let search_previous_id = tab.id.clone();
+    let search_next_id = tab.id.clone();
+    let terminal_input_view = view.clone();
+    let terminal_input_id = tab.id.clone();
+    let terminal_select_view = view.clone();
+    let terminal_select_id = tab.id.clone();
+    let terminal_finish_view = view.clone();
+    let terminal_finish_id = tab.id.clone();
+    let terminal_copy_view = view.clone();
+    let terminal_copy_id = tab.id.clone();
+    let terminal_focus = tab.terminal_focus.clone();
+    let terminal_control: Option<crate::forward::SshTerminalControl> =
+        tab.terminal.as_ref().map(|terminal| terminal.control());
+    let terminal_size_state = tab.terminal_size.clone();
+    let terminal_content_left = tab.terminal_content_left.clone();
+    let terminal_left_for_resize = terminal_content_left.clone();
+    let terminal_left_for_lines = terminal_content_left.clone();
     let font_size_view = view.clone();
     let font_size_tab_id = tab.id.clone();
     let custom_font_size = tab.terminal_font_size;
     let terminal_font_size = custom_font_size.unwrap_or(global_font_size);
+    let terminal_selection = tab.terminal_selection;
+    let terminal_scroll_for_selection = tab.terminal_scroll.clone();
+    let terminal_scrollbar = tab.terminal_scroll.clone();
+    let terminal_search_query = tab.terminal_search.read(cx).value().to_string();
+    let terminal_search_matches = std::sync::Arc::new(super::app::terminal_search_matches(
+        &tab.terminal_lines,
+        &terminal_search_query,
+    ));
+    let terminal_search_index = tab
+        .terminal_search_index
+        .filter(|index| *index < terminal_search_matches.len());
+    let active_terminal_search_match = terminal_search_index
+        .and_then(|index| terminal_search_matches.get(index))
+        .cloned();
+    let terminal_search_status = if terminal_search_matches.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            terminal_search_index.map(|index| index + 1).unwrap_or(0),
+            terminal_search_matches.len()
+        )
+    };
     let add_quick_command_view = view.clone();
     let quick_command_buttons = quick_commands.iter().map(|quick_command| {
         let fill_view = view.clone();
@@ -269,7 +399,7 @@ fn render_terminal(
                     .tooltip(quick_command.command.clone())
                     .on_click(move |_, window, cx| {
                         fill_view.update(cx, |this, cx| {
-                            this.fill_ssh_command(&fill_tab_id, &command, window, cx)
+                            this.run_ssh_quick_command(&fill_tab_id, &command, window, cx)
                         });
                     }),
             )
@@ -310,11 +440,82 @@ fn render_terminal(
                 .child(
                     h_flex()
                         .gap_1()
+                        .when(tab.terminal_search_open, |actions| {
+                            actions
+                                .child(
+                                    div().w(px(220.)).child(
+                                        Input::new(&tab.terminal_search)
+                                            .prefix(Icon::new(IconName::Search).small()),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .min_w(px(42.))
+                                        .text_center()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(terminal_search_status),
+                                )
+                                .child(
+                                    Button::new(format!("ssh-search-previous-{}", tab.id))
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(IconName::ArrowUp)
+                                        .tooltip("上一个匹配项（Shift+Enter）")
+                                        .on_click(move |_, window, cx| {
+                                            search_previous_view.update(cx, |this, cx| {
+                                                this.navigate_ssh_terminal_search(
+                                                    &search_previous_id,
+                                                    -1,
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new(format!("ssh-search-next-{}", tab.id))
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(IconName::ArrowDown)
+                                        .tooltip("下一个匹配项（Enter）")
+                                        .on_click(move |_, window, cx| {
+                                            search_next_view.update(cx, |this, cx| {
+                                                this.navigate_ssh_terminal_search(
+                                                    &search_next_id,
+                                                    1,
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                )
+                        })
+                        .child(
+                            Button::new(format!("ssh-search-toggle-{}", tab.id))
+                                .xsmall()
+                                .ghost()
+                                .icon(if tab.terminal_search_open {
+                                    IconName::Close
+                                } else {
+                                    IconName::Search
+                                })
+                                .tooltip(if tab.terminal_search_open {
+                                    "关闭搜索"
+                                } else {
+                                    "搜索终端内容"
+                                })
+                                .on_click(move |_, window, cx| {
+                                    search_view.update(cx, |this, cx| {
+                                        this.toggle_ssh_terminal_search(&search_id, window, cx)
+                                    });
+                                }),
+                        )
                         .child(
                             Button::new(format!("ssh-font-size-{}", tab.id))
                                 .xsmall()
                                 .ghost()
-                                .label(format!("输出字号 {terminal_font_size:.0}px"))
+                                .label(format!("字号 {terminal_font_size:.0}px"))
                                 .dropdown_caret(true)
                                 .tooltip(if custom_font_size.is_some() {
                                     "SSH 输出内容使用独立字号"
@@ -380,7 +581,7 @@ fn render_terminal(
                                 .xsmall()
                                 .ghost()
                                 .icon(IconName::Delete)
-                                .tooltip("清空输入和终端内容")
+                                .tooltip("清空终端内容")
                                 .on_click(move |_, window, cx| {
                                     clear_view.update(cx, |this, cx| {
                                         this.clear_ssh_terminal(&clear_id, window, cx)
@@ -409,101 +610,235 @@ fn render_terminal(
                         ),
                 ),
         )
-        .child(
-            div().flex_1().min_h_0().child(
-                v_resizable(format!("ssh-terminal-panels-{}", tab.id))
-                    .child(
-                        resizable_panel().child(
-                            v_flex()
-                                .size_full()
-                                .min_h_0()
-                                .p_3()
-                                .bg(gpui::rgb(0xffffff))
-                                .text_color(gpui::rgb(0x111827))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .size_full()
-                                        .child(
-                                            div()
-                                                .id(format!("ssh-terminal-scroll-{}", tab.id))
-                                                .size_full()
-                                                .overflow_y_scroll()
-                                                .track_scroll(&tab.terminal_scroll)
-                                                .child(
-                                                    TextView::new(&tab.terminal_view)
-                                                        .style(
-                                                            TextViewStyle::default().code_block(
-                                                                StyleRefinement::default()
-                                                                    .text_size(px(
-                                                                        terminal_font_size,
-                                                                    )),
-                                                            ),
-                                                        )
-                                                        .selectable(true),
-                                                ),
-                                        )
-                                        .child(
-                                            Scrollbar::vertical(&tab.terminal_scroll)
-                                                .id(format!("ssh-terminal-scrollbar-{}", tab.id)),
-                                        ),
-                                )
-                                .into_any_element(),
-                        ),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size(px(150.))
-                            .size_range(px(110.)..px(420.))
-                            .child(
-                                v_flex()
-                                    .size_full()
-                                    .min_h_0()
-                                    .gap_2()
-                                    .p_2()
-                                    .border_t_1()
-                                    .border_color(cx.theme().border)
-                                    .bg(gpui::rgb(0xffffff))
-                                    .text_color(gpui::rgb(0x111827))
-                                    .child(
-                                        div().flex_1().min_h_0().child(
-                                            Input::new(&tab.command).font_family("monospace"),
-                                        ),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .flex_shrink_0()
-                                            .gap_1()
-                                            .child(
-                                                Button::new(format!(
-                                                    "add-quick-command-{}",
-                                                    tab.id
-                                                ))
-                                                .xsmall()
-                                                .outline()
-                                                .icon(IconName::Plus)
-                                                .label("快捷命令")
-                                                .on_click(move |_, window, cx| {
-                                                    open_quick_command_dialog(
-                                                        add_quick_command_view.clone(),
-                                                        None,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }),
+        .child(div().flex_1().min_h_0().p_2().bg(rgb(0xffffff)).child({
+            let terminal_lines = tab.terminal_lines.clone();
+            let line_count = terminal_lines.len();
+            let terminal_scroll_size = size(
+                px(1.),
+                px(terminal_font_size * 1.45 * line_count.max(1) as f32),
+            );
+            let terminal_search_matches = terminal_search_matches.clone();
+            div()
+                .id(format!("ssh-terminal-input-{}", tab.id))
+                .relative()
+                .size_full()
+                .min_h_0()
+                .border_1()
+                .border_color(cx.theme().border)
+                .rounded_md()
+                .overflow_hidden()
+                .focusable()
+                .track_focus(&tab.terminal_focus)
+                .key_context("SshTerminal")
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    terminal_focus.focus(window, cx);
+                })
+                .on_key_down(move |event, window, cx| {
+                    let handled = terminal_input_view.update(cx, |this, cx| {
+                        this.send_ssh_keystroke(&terminal_input_id, event, window, cx)
+                    });
+                    if handled {
+                        cx.stop_propagation();
+                    }
+                })
+                .on_prepaint(move |bounds, _, _| {
+                    terminal_left_for_resize.set(f32::from(bounds.origin.x));
+                    let Some(control) = terminal_control.as_ref() else {
+                        return;
+                    };
+                    let width = (f32::from(bounds.size.width) - 16.).max(1.);
+                    let height = (f32::from(bounds.size.height) - 16.).max(1.);
+                    let cols = (width / (terminal_font_size * 0.62)).floor() as u16;
+                    let rows = (height / (terminal_font_size * 1.45)).floor() as u16;
+                    let size = (cols.max(20), rows.max(5));
+                    if terminal_size_state.get() != size {
+                        terminal_size_state.set(size);
+                        control.resize(size.0, size.1);
+                    }
+                })
+                .child(
+                    uniform_list(
+                        format!("ssh-terminal-lines-{}", tab.id),
+                        line_count,
+                        move |range, _, _| {
+                            range
+                                .map(|index| {
+                                    let line = &terminal_lines[index];
+                                    let base_highlights = line.styles.iter().map(|span| {
+                                        (span.range.clone(), terminal_highlight(span.style))
+                                    });
+                                    let search_highlights = terminal_search_matches
+                                        .iter()
+                                        .filter(|matched| matched.line == index)
+                                        .map(|matched| {
+                                            let is_active = active_terminal_search_match
+                                                .as_ref()
+                                                .is_some_and(|active| active == matched);
+                                            (
+                                                matched.range.clone(),
+                                                HighlightStyle {
+                                                    background_color: Some(
+                                                        rgb(if is_active {
+                                                            0xf59e0b
+                                                        } else {
+                                                            0xfde68a
+                                                        })
+                                                        .opacity(if is_active { 0.9 } else { 0.65 })
+                                                        .into(),
+                                                    ),
+                                                    color: is_active
+                                                        .then_some(rgb(0x111827).into()),
+                                                    ..HighlightStyle::default()
+                                                },
                                             )
-                                            .child(
-                                                h_flex()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .gap_1()
-                                                    .overflow_x_scrollbar()
-                                                    .children(quick_command_buttons),
-                                            ),
-                                    ),
-                            ),
-                    ),
-            ),
+                                        });
+                                    let selected = terminal_selection_range(
+                                        index,
+                                        &line.text,
+                                        terminal_selection,
+                                    )
+                                    .map(|range| {
+                                        (
+                                            range,
+                                            HighlightStyle {
+                                                background_color: Some(
+                                                    rgb(0x93c5fd).opacity(0.65).into(),
+                                                ),
+                                                ..HighlightStyle::default()
+                                            },
+                                        )
+                                    });
+                                    let highlights =
+                                        combine_highlights(base_highlights, search_highlights);
+                                    let highlights = combine_highlights(highlights, selected)
+                                        .collect::<Vec<_>>();
+                                    let begin_view = terminal_select_view.clone();
+                                    let update_view = terminal_select_view.clone();
+                                    let select_id = terminal_select_id.clone();
+                                    let update_id = terminal_select_id.clone();
+                                    let content_left = terminal_left_for_lines.clone();
+                                    let update_content_left = terminal_left_for_lines.clone();
+                                    let begin_scroll = terminal_scroll_for_selection.clone();
+                                    let update_scroll = terminal_scroll_for_selection.clone();
+                                    div()
+                                        .h(px(terminal_font_size * 1.45))
+                                        .min_w_full()
+                                        .px_2()
+                                        .font_family("monospace")
+                                        .text_size(px(terminal_font_size))
+                                        .line_height(px(terminal_font_size * 1.45))
+                                        .text_color(rgb(0x111827))
+                                        .whitespace_nowrap()
+                                        .cursor_text()
+                                        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                                            let column = terminal_column(
+                                                event.position.x,
+                                                content_left.get()
+                                                    + f32::from(
+                                                        begin_scroll
+                                                            .0
+                                                            .borrow()
+                                                            .base_handle
+                                                            .offset()
+                                                            .x,
+                                                    ),
+                                                terminal_font_size,
+                                            );
+                                            begin_view.update(cx, |this, cx| {
+                                                this.begin_ssh_terminal_selection(
+                                                    &select_id, index, column, cx,
+                                                )
+                                            });
+                                        })
+                                        .on_mouse_move(move |event, _, cx| {
+                                            if !event.dragging() {
+                                                return;
+                                            }
+                                            let column = terminal_column(
+                                                event.position.x,
+                                                update_content_left.get()
+                                                    + f32::from(
+                                                        update_scroll
+                                                            .0
+                                                            .borrow()
+                                                            .base_handle
+                                                            .offset()
+                                                            .x,
+                                                    ),
+                                                terminal_font_size,
+                                            );
+                                            update_view.update(cx, |this, cx| {
+                                                this.update_ssh_terminal_selection(
+                                                    &update_id, index, column, cx,
+                                                )
+                                            });
+                                        })
+                                        .child(
+                                            StyledText::new(line.text.clone())
+                                                .with_highlights(highlights),
+                                        )
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .track_scroll(&tab.terminal_scroll)
+                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                    .size_full(),
+                )
+                .child(
+                    Scrollbar::vertical(&terminal_scrollbar)
+                        .id(format!("ssh-terminal-scrollbar-{}", tab.id))
+                        .scroll_size(terminal_scroll_size)
+                        .scrollbar_show(ScrollbarShow::Always),
+                )
+                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                    terminal_finish_view.update(cx, |this, cx| {
+                        this.finish_ssh_terminal_selection(&terminal_finish_id, cx)
+                    });
+                })
+                .context_menu(move |menu, _, _| {
+                    let copy_view = terminal_copy_view.clone();
+                    let copy_id = terminal_copy_id.clone();
+                    menu.item(
+                        PopupMenuItem::new("复制选中内容").on_click(move |_, _, cx| {
+                            copy_view.update(cx, |this, cx| {
+                                this.copy_ssh_terminal_selection(&copy_id, cx);
+                            });
+                        }),
+                    )
+                })
+        }))
+        .child(
+            h_flex()
+                .h(px(42.))
+                .flex_shrink_0()
+                .px_2()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(
+                    Button::new(format!("add-quick-command-{}", tab.id))
+                        .xsmall()
+                        .outline()
+                        .icon(IconName::Plus)
+                        .label("快捷命令")
+                        .on_click(move |_, window, cx| {
+                            open_quick_command_dialog(
+                                add_quick_command_view.clone(),
+                                None,
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .overflow_x_scrollbar()
+                        .children(quick_command_buttons),
+                ),
         )
         .into_any_element()
 }
@@ -514,8 +849,192 @@ fn format_size(size: u64) -> String {
     } else if size < 1_048_576 {
         format!("{:.1} KB", size as f64 / 1_024.)
     } else {
-        format!("{:.1} MB", size as f64 / 1_048_576.)
+        let megabytes = size as f64 / 1_048_576.;
+        if megabytes < 1_024. {
+            format!("{megabytes:.1} MB")
+        } else {
+            format!("{:.1} GB", megabytes / 1_024.)
+        }
     }
+}
+
+fn render_transfer_panel(
+    tab: &SshTab,
+    view: &Entity<AppView>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let transfers = tab.transfers.iter().map(|transfer| {
+        let snapshot = transfer.progress.snapshot();
+        let percentage = if snapshot.total_bytes == 0 {
+            if transfer.status == TransferStatus::Completed {
+                100.
+            } else {
+                0.
+            }
+        } else {
+            snapshot.transferred_bytes as f32 * 100. / snapshot.total_bytes as f32
+        };
+        let (status, status_color) = match &transfer.status {
+            TransferStatus::Running => ("进行中", cx.theme().primary),
+            TransferStatus::Cancelling => ("正在取消", cx.theme().warning),
+            TransferStatus::Completed => ("已完成", cx.theme().success),
+            TransferStatus::Cancelled => ("已取消", cx.theme().muted_foreground),
+            TransferStatus::Failed(_) => ("失败", cx.theme().danger),
+        };
+        let cancel_view = view.clone();
+        let cancel_tab_id = tab.id.clone();
+        let cancel_transfer_id = transfer.id.clone();
+        let files = snapshot.files.iter().map(|file| {
+            let file_percentage = if file.size == 0 {
+                if file.completed { 100. } else { 0. }
+            } else {
+                file.transferred as f32 * 100. / file.size as f32
+            };
+            v_flex()
+                .gap_1()
+                .py_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .text_xs()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(file.path.clone()),
+                        )
+                        .child(format!(
+                            "{} / {}",
+                            format_size(file.transferred),
+                            format_size(file.size)
+                        )),
+                )
+                .child(
+                    Progress::new(format!("transfer-file-{}-{}", transfer.id, file.path))
+                        .xsmall()
+                        .value(file_percentage),
+                )
+        });
+
+        v_flex()
+            .p_2()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(match transfer.direction {
+                            TransferDirection::Upload => IconName::ArrowUp,
+                            TransferDirection::Download => IconName::ArrowDown,
+                        })
+                        .small(),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(transfer.title.clone()),
+                    )
+                    .child(div().text_xs().text_color(status_color).child(status))
+                    .when(
+                        matches!(
+                            transfer.status,
+                            TransferStatus::Running | TransferStatus::Cancelling
+                        ),
+                        |row| {
+                            row.child(
+                                Button::new(format!("cancel-transfer-{}", transfer.id))
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(IconName::Close)
+                                    .tooltip("取消传输")
+                                    .disabled(transfer.status == TransferStatus::Cancelling)
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view.update(cx, |this, cx| {
+                                            this.cancel_ssh_transfer(
+                                                &cancel_tab_id,
+                                                &cancel_transfer_id,
+                                                cx,
+                                            )
+                                        });
+                                    }),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                Progress::new(format!("transfer-total-{}", transfer.id))
+                    .small()
+                    .loading(
+                        snapshot.files.is_empty()
+                            && matches!(
+                                transfer.status,
+                                TransferStatus::Running | TransferStatus::Cancelling
+                            ),
+                    )
+                    .value(percentage),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "{} / {}（{percentage:.0}%）",
+                        format_size(snapshot.transferred_bytes),
+                        format_size(snapshot.total_bytes)
+                    ))
+                    .child(format!(
+                        "开始 {}  结束 {}",
+                        transfer.started_at,
+                        transfer.finished_at.as_deref().unwrap_or("-")
+                    )),
+            )
+            .when_some(
+                match &transfer.status {
+                    TransferStatus::Failed(error) => Some(error.clone()),
+                    _ => None,
+                },
+                |card, error| {
+                    card.child(div().text_xs().text_color(cx.theme().danger).child(error))
+                },
+            )
+            .when(!snapshot.files.is_empty(), |card| {
+                card.child(
+                    v_flex()
+                        .max_h(px(160.))
+                        .overflow_y_scrollbar()
+                        .children(files),
+                )
+            })
+    });
+
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .gap_1()
+        .p_2()
+        .overflow_y_scrollbar()
+        .when(tab.transfers.is_empty(), |panel| {
+            panel.child(
+                div()
+                    .py_6()
+                    .text_center()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("暂无上传或下载任务"),
+            )
+        })
+        .children(transfers)
+        .into_any_element()
 }
 
 fn format_modified_time(timestamp: Option<u64>) -> String {
@@ -523,10 +1042,50 @@ fn format_modified_time(timestamp: Option<u64>) -> String {
         .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp as i64, 0))
         .map(|time| {
             time.with_timezone(&chrono::Local)
-                .format("%m-%d %H:%M")
+                .format("%Y-%m-%d %H:%M:%S")
                 .to_string()
         })
         .unwrap_or_else(|| "-".into())
+}
+
+fn remote_special_rank(name: &str) -> u8 {
+    match name {
+        "." => 0,
+        ".." => 1,
+        _ => 2,
+    }
+}
+
+fn sorted_remote_entries(
+    entries: &[crate::forward::RemoteEntry],
+    field: RemoteSortField,
+    ascending: bool,
+) -> Vec<crate::forward::RemoteEntry> {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|left, right| {
+        let left_rank = remote_special_rank(&left.name);
+        let right_rank = remote_special_rank(&right.name);
+        if left_rank != right_rank {
+            return left_rank.cmp(&right_rank);
+        }
+        if left_rank < 2 {
+            return std::cmp::Ordering::Equal;
+        }
+        let ordering = match field {
+            RemoteSortField::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+            RemoteSortField::Modified => left
+                .modified_at
+                .unwrap_or_default()
+                .cmp(&right.modified_at.unwrap_or_default())
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase())),
+        };
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+    entries
 }
 
 fn format_permissions(permissions: Option<u32>) -> String {
@@ -548,40 +1107,78 @@ fn render_file_panel(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let parent_view = view.clone();
-    let upload_view = view.clone();
     let drop_view = view.clone();
     let menu_view = view.clone();
     let new_file_view = view.clone();
     let new_directory_view = view.clone();
+    let entry_new_file_view = view.clone();
+    let entry_new_directory_view = view.clone();
+    let entry_upload_view = view.clone();
     let file_view_settings = view.clone();
+    let panel_view = view.clone();
+    let name_sort_view = view.clone();
+    let modified_sort_view = view.clone();
     let parent_id = tab.id.clone();
-    let upload_id = tab.id.clone();
     let drop_id = tab.id.clone();
     let menu_id = tab.id.clone();
     let new_file_id = tab.id.clone();
     let new_directory_id = tab.id.clone();
+    let entry_new_file_id = tab.id.clone();
+    let entry_new_directory_id = tab.id.clone();
+    let entry_upload_id = tab.id.clone();
     let file_view_settings_id = tab.id.clone();
+    let panel_view_id = tab.id.clone();
+    let name_sort_id = tab.id.clone();
+    let modified_sort_id = tab.id.clone();
     let parent = crate::forward::parent_path(&tab.remote_path);
     let show_file_time = tab.show_file_time;
     let show_file_size = tab.show_file_size;
     let show_file_permissions = tab.show_file_permissions;
-    let panel_width = 300.
-        + if show_file_time { 92. } else { 0. }
-        + if show_file_size { 58. } else { 0. }
-        + if show_file_permissions { 58. } else { 0. };
-    let entries = tab.remote_entries.iter().map(|entry| {
+    let showing_transfers = tab.file_panel_view == SshFilePanelView::Transfers;
+    let transfer_panel = showing_transfers.then(|| render_transfer_panel(tab, view, cx));
+    let sorted_entries = sorted_remote_entries(
+        &tab.remote_entries,
+        tab.remote_sort_field,
+        tab.remote_sort_ascending,
+    );
+    let sort_suffix = |field| {
+        if tab.remote_sort_field == field {
+            if tab.remote_sort_ascending {
+                " ↑"
+            } else {
+                " ↓"
+            }
+        } else {
+            ""
+        }
+    };
+    let name_sort_label = format!("名称{}", sort_suffix(RemoteSortField::Name));
+    let modified_sort_label = format!("修改时间{}", sort_suffix(RemoteSortField::Modified));
+    let entries = sorted_entries.iter().map(|entry| {
+        let is_parent = entry.name == "..";
+        let is_special = entry.name == "." || is_parent;
         let open_view = view.clone();
         let download_view = view.clone();
         let menu_download_view = view.clone();
+        let delete_view = view.clone();
         let drag_view = view.clone();
         let open_id = tab.id.clone();
         let download_id = tab.id.clone();
         let menu_download_id = tab.id.clone();
+        let delete_id = tab.id.clone();
         let drag_id = tab.id.clone();
         let open_entry = entry.clone();
         let download_entry = entry.clone();
         let menu_entry = entry.clone();
+        let delete_entry = entry.clone();
         let drag_entry = entry.clone();
+        let copy_path = entry.path.clone();
+        let new_file_view = entry_new_file_view.clone();
+        let new_directory_view = entry_new_directory_view.clone();
+        let upload_view = entry_upload_view.clone();
+        let new_file_id = entry_new_file_id.clone();
+        let new_directory_id = entry_new_directory_id.clone();
+        let upload_id = entry_upload_id.clone();
         let target = drag_target(&tab.id, &entry.name);
         let paths = ExternalPaths(vec![target].into());
         h_flex()
@@ -600,11 +1197,26 @@ fn render_file_panel(
                 })
                 .small(),
             )
-            .child(div().flex_1().min_w_0().text_sm().child(entry.name.clone()))
+            .child(
+                div()
+                    .id(format!("remote-entry-name-{}-{}", tab.id, entry.path))
+                    .flex_1()
+                    .min_w_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_left()
+                    .child(entry.name.clone())
+                    .tooltip({
+                        let name = entry.name.clone();
+                        move |window, cx| Tooltip::new(name.clone()).build(window, cx)
+                    }),
+            )
             .when(show_file_time, |row| {
                 row.child(
                     div()
-                        .w(px(88.))
+                        .w(px(146.))
                         .flex_none()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
@@ -638,23 +1250,25 @@ fn render_file_panel(
                         .child(format_permissions(entry.permissions)),
                 )
             })
-            .child(
-                Button::new(format!("download-{}-{}", tab.id, entry.path))
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::ArrowDown)
-                    .tooltip("下载")
-                    .on_click(move |_, window, cx| {
-                        download_view.update(cx, |this, cx| {
-                            this.prompt_ssh_download(
-                                &download_id,
-                                download_entry.clone(),
-                                window,
-                                cx,
-                            )
-                        });
-                    }),
-            )
+            .when(!is_special, |row| {
+                row.child(
+                    Button::new(format!("download-{}-{}", tab.id, entry.path))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::ArrowDown)
+                        .tooltip("下载")
+                        .on_click(move |_, window, cx| {
+                            download_view.update(cx, |this, cx| {
+                                this.prompt_ssh_download(
+                                    &download_id,
+                                    download_entry.clone(),
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }),
+                )
+            })
             .when(entry.is_dir, |row| {
                 row.on_click(move |_, window, cx| {
                     open_view.update(cx, |this, cx| {
@@ -662,28 +1276,92 @@ fn render_file_panel(
                     });
                 })
             })
-            .on_drag(paths, move |paths: &ExternalPaths, _, window, cx| {
-                drag_view.update(cx, |this, cx| {
-                    this.prepare_ssh_drag(&drag_id, drag_entry.clone(), window, cx);
-                });
-                cx.new(|_| paths.clone())
+            .when(!is_special, |row| {
+                row.on_drag(paths, move |paths: &ExternalPaths, _, window, cx| {
+                    drag_view.update(cx, |this, cx| {
+                        this.prepare_ssh_drag(&drag_id, drag_entry.clone(), window, cx);
+                    });
+                    cx.new(|_| paths.clone())
+                })
             })
-            .context_menu(move |menu, _, _| {
-                menu.item(PopupMenuItem::new("下载").on_click({
-                    let entry = menu_entry.clone();
-                    let view = menu_download_view.clone();
-                    let id = menu_download_id.clone();
-                    move |_, window, cx| {
-                        view.update(cx, |this, cx| {
-                            this.prompt_ssh_download(&id, entry.clone(), window, cx)
-                        });
-                    }
-                }))
+            .map(|row| {
+                row.context_menu(move |menu, _, _| {
+                    let copy_path = copy_path.clone();
+                    let menu = menu.item(PopupMenuItem::new("复制完整路径").on_click(
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                        },
+                    ));
+                    let menu = if is_special {
+                        menu
+                    } else {
+                        let delete_view = delete_view.clone();
+                        let delete_id = delete_id.clone();
+                        let delete_entry_for_action = delete_entry.clone();
+                        menu.separator()
+                            .item(PopupMenuItem::new("下载").on_click({
+                                let entry = menu_entry.clone();
+                                let view = menu_download_view.clone();
+                                let id = menu_download_id.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.prompt_ssh_download(&id, entry.clone(), window, cx)
+                                    });
+                                }
+                            }))
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(if delete_entry.is_dir {
+                                    "删除文件夹"
+                                } else {
+                                    "删除文件"
+                                })
+                                .on_click(move |_, window, cx| {
+                                    delete_view.update(cx, |this, cx| {
+                                        this.confirm_delete_ssh_entry(
+                                            &delete_id,
+                                            delete_entry_for_action.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            )
+                    };
+                    menu.separator()
+                        .item(PopupMenuItem::new("新建文件夹").on_click({
+                            let view = new_directory_view.clone();
+                            let id = new_directory_id.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.prompt_create_ssh_entry(&id, true, window, cx)
+                                });
+                            }
+                        }))
+                        .item(PopupMenuItem::new("新建文件").on_click({
+                            let view = new_file_view.clone();
+                            let id = new_file_id.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.prompt_create_ssh_entry(&id, false, window, cx)
+                                });
+                            }
+                        }))
+                        .separator()
+                        .item(PopupMenuItem::new("上传文件或文件夹").on_click({
+                            let view = upload_view.clone();
+                            let id = upload_id.clone();
+                            move |_, window, cx| {
+                                view.update(cx, |this, cx| this.prompt_ssh_upload(&id, window, cx));
+                            }
+                        }))
+                })
+                .into_any_element()
             })
     });
 
     v_flex()
-        .w(px(panel_width))
+        .size_full()
         .min_w(px(300.))
         .h_full()
         .border_l_1()
@@ -762,85 +1440,164 @@ fn render_file_panel(
                         }),
                 )
                 .child(
-                    Button::new(format!("remote-upload-{}", tab.id))
+                    Button::new(format!("remote-panel-view-{}", tab.id))
                         .xsmall()
-                        .outline()
-                        .label("上传")
-                        .on_click(move |_, window, cx| {
-                            upload_view.update(cx, |this, cx| {
-                                this.prompt_ssh_upload(&upload_id, window, cx)
+                        .ghost()
+                        .icon(if showing_transfers {
+                            IconName::Folder
+                        } else {
+                            IconName::ArrowDown
+                        })
+                        .tooltip(if showing_transfers {
+                            "切换到远程文件列表"
+                        } else {
+                            "切换到上传 / 下载列表"
+                        })
+                        .on_click(move |_, _, cx| {
+                            panel_view.update(cx, |this, cx| {
+                                this.toggle_ssh_file_panel_view(&panel_view_id, cx)
                             });
                         }),
                 ),
         )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .p_2()
-                .gap_1()
-                .overflow_y_scrollbar()
-                .drag_over::<ExternalPaths>(|style, _, _, cx| {
-                    style.bg(cx.theme().primary.opacity(0.08))
-                })
-                .on_drop(move |paths: &ExternalPaths, window, cx| {
-                    drop_view.update(cx, |this, cx| {
-                        this.upload_ssh_paths(&drop_id, paths.paths().to_vec(), window, cx)
-                    });
-                })
-                .when(tab.file_loading, |list| {
-                    list.child(
-                        div()
-                            .py_6()
-                            .text_center()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("正在读取目录…"),
+        .when(!showing_transfers, |panel| {
+            panel.child(
+                h_flex()
+                    .h(px(28.))
+                    .px_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(div().w(px(16.)).flex_none())
+                    .child(
+                        Button::new(format!("remote-sort-name-{}", tab.id))
+                            .xsmall()
+                            .ghost()
+                            .flex_1()
+                            .min_w_0()
+                            .label(name_sort_label)
+                            .on_click(move |_, _, cx| {
+                                name_sort_view.update(cx, |this, cx| {
+                                    this.sort_ssh_remote_entries(
+                                        &name_sort_id,
+                                        RemoteSortField::Name,
+                                        cx,
+                                    )
+                                });
+                            }),
                     )
-                })
-                .when(
-                    !tab.file_loading && tab.file_error.is_none() && tab.remote_entries.is_empty(),
-                    |list| {
+                    .when(show_file_time, |row| {
+                        row.child(
+                            Button::new(format!("remote-sort-modified-{}", tab.id))
+                                .xsmall()
+                                .ghost()
+                                .w(px(146.))
+                                .flex_none()
+                                .label(modified_sort_label)
+                                .on_click(move |_, _, cx| {
+                                    modified_sort_view.update(cx, |this, cx| {
+                                        this.sort_ssh_remote_entries(
+                                            &modified_sort_id,
+                                            RemoteSortField::Modified,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                    })
+                    .when(show_file_size, |row| {
+                        row.child(div().w(px(54.)).flex_none().text_right().child("大小"))
+                    })
+                    .when(show_file_permissions, |row| {
+                        row.child(div().w(px(54.)).flex_none().text_right().child("权限"))
+                    })
+                    .child(div().w(px(24.)).flex_none()),
+            )
+        })
+        .children(transfer_panel)
+        .when(!showing_transfers, |panel| {
+            panel.child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .p_2()
+                    .gap_1()
+                    .overflow_y_scrollbar()
+                    .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                        style.bg(cx.theme().primary.opacity(0.08))
+                    })
+                    .on_drop(move |paths: &ExternalPaths, window, cx| {
+                        drop_view.update(cx, |this, cx| {
+                            this.upload_ssh_paths(&drop_id, paths.paths().to_vec(), window, cx)
+                        });
+                    })
+                    .when(tab.file_loading, |list| {
                         list.child(
                             div()
                                 .py_6()
                                 .text_center()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("目录为空，可拖入文件上传"),
+                                .child("正在读取目录…"),
                         )
-                    },
-                )
-                .children(entries)
-                .context_menu(move |menu, _, _| {
-                    menu.item(PopupMenuItem::new("新建文件夹").on_click({
-                        let view = new_directory_view.clone();
-                        let id = new_directory_id.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| {
-                                this.prompt_create_ssh_entry(&id, true, window, cx)
-                            });
-                        }
-                    }))
-                    .item(PopupMenuItem::new("新建文件").on_click({
-                        let view = new_file_view.clone();
-                        let id = new_file_id.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| {
-                                this.prompt_create_ssh_entry(&id, false, window, cx)
-                            });
-                        }
-                    }))
-                    .separator()
-                    .item(PopupMenuItem::new("上传文件或文件夹").on_click({
-                        let view = menu_view.clone();
-                        let id = menu_id.clone();
-                        move |_, window, cx| {
-                            view.update(cx, |this, cx| this.prompt_ssh_upload(&id, window, cx));
-                        }
-                    }))
-                }),
-        )
+                    })
+                    .when(
+                        !tab.file_loading
+                            && tab.file_error.is_none()
+                            && tab.remote_entries.is_empty(),
+                        |list| {
+                            list.child(
+                                div()
+                                    .py_6()
+                                    .text_center()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("目录为空，可拖入文件上传"),
+                            )
+                        },
+                    )
+                    .children(entries)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(40.))
+                            .context_menu(move |menu, _, _| {
+                                menu.item(PopupMenuItem::new("新建文件夹").on_click({
+                                    let view = new_directory_view.clone();
+                                    let id = new_directory_id.clone();
+                                    move |_, window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.prompt_create_ssh_entry(&id, true, window, cx)
+                                        });
+                                    }
+                                }))
+                                .item(PopupMenuItem::new("新建文件").on_click({
+                                    let view = new_file_view.clone();
+                                    let id = new_file_id.clone();
+                                    move |_, window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.prompt_create_ssh_entry(&id, false, window, cx)
+                                        });
+                                    }
+                                }))
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new("上传文件或文件夹").on_click({
+                                        let view = menu_view.clone();
+                                        let id = menu_id.clone();
+                                        move |_, window, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.prompt_ssh_upload(&id, window, cx)
+                                            });
+                                        }
+                                    }),
+                                )
+                            }),
+                    ),
+            )
+        })
         .into_any_element()
 }
 
@@ -874,9 +1631,9 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                         .label("新增连接")
                         .disabled(hosts.is_empty())
                         .tooltip(if hosts.is_empty() {
-                            "请先新增跳板机"
+                            "请先新增服务器"
                         } else {
-                            "选择跳板机并新建连接"
+                            "选择服务器并新建连接"
                         })
                         .on_click(move |_, window, cx| {
                             connect_view.update(cx, |this, cx| {
@@ -894,27 +1651,29 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
         )
         .child(if let Some(tab) = active_tab {
             if tab.file_panel_open {
-                h_flex()
-                    .flex_1()
-                    .size_full()
-                    .min_w_0()
-                    .min_h_0()
-                    .overflow_hidden()
+                let initial_file_width = 300.
+                    + if tab.show_file_time { 150. } else { 0. }
+                    + if tab.show_file_size { 58. } else { 0. }
+                    + if tab.show_file_permissions { 58. } else { 0. };
+                h_resizable(format!("ssh-content-panels-{}", tab.id))
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .min_h_0()
-                            .child(render_terminal(
+                        resizable_panel().child(div().size_full().min_w_0().min_h_0().child(
+                            render_terminal(
                                 tab,
                                 &view_state.quick_commands,
                                 view_state.ui_font_size(),
                                 &view,
                                 cx,
-                            )),
+                            ),
+                        )),
                     )
-                    .child(render_file_panel(tab, &view, cx))
+                    .child(
+                        resizable_panel()
+                            .size(px(initial_file_width))
+                            .size_range(px(300.)..px(900.))
+                            .flex_none()
+                            .child(render_file_panel(tab, &view, cx)),
+                    )
                     .into_any_element()
             } else {
                 div()
@@ -940,11 +1699,52 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                 .justify_center()
                 .text_color(cx.theme().muted_foreground)
                 .child(if view_state.jump_hosts.is_empty() {
-                    "请先新增跳板机"
+                    "请先新增服务器"
                 } else {
                     "点击右上角“新增连接”"
                 })
                 .into_any_element()
         })
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RemoteSortField, sorted_remote_entries};
+    use crate::forward::RemoteEntry;
+
+    fn entry(name: &str, modified_at: u64) -> RemoteEntry {
+        RemoteEntry {
+            name: name.into(),
+            path: format!("/{name}"),
+            is_dir: false,
+            size: 0,
+            modified_at: Some(modified_at),
+            permissions: None,
+        }
+    }
+
+    #[test]
+    fn remote_sort_keeps_dot_entries_first_in_both_directions() {
+        let entries = vec![
+            entry("beta", 1),
+            entry("..", 0),
+            entry("alpha", 2),
+            entry(".", 0),
+        ];
+        let descending = sorted_remote_entries(&entries, RemoteSortField::Name, false);
+        assert_eq!(
+            descending
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![".", "..", "beta", "alpha"]
+        );
+
+        let by_time = sorted_remote_entries(&entries, RemoteSortField::Modified, true);
+        assert_eq!(by_time[0].name, ".");
+        assert_eq!(by_time[1].name, "..");
+        assert_eq!(by_time[2].name, "beta");
+        assert_eq!(by_time[3].name, "alpha");
+    }
 }

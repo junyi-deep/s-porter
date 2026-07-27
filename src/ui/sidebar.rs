@@ -39,7 +39,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> impl In
         )
         .child(
             SidebarGroup::new("连接").child(SidebarMenu::new().children([
-                menu_item("跳板机", IconName::Settings2, Page::JumpHosts),
+                menu_item("服务器", IconName::Settings2, Page::JumpHosts),
                 menu_item("SSH 连接", IconName::SquareTerminal, Page::Ssh),
                 menu_item("端口转发", IconName::Network, Page::Forward),
             ])),

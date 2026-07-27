@@ -55,9 +55,9 @@ where
                             .text_center()
                             .text_color(cx.theme().muted_foreground)
                             .child(if hosts.is_empty() {
-                                "暂无跳板机"
+                                "暂无服务器"
                             } else {
-                                "没有符合搜索条件的跳板机"
+                                "没有符合搜索条件的服务器"
                             }),
                     )
                 })

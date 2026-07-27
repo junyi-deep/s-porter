@@ -25,7 +25,7 @@ pub struct JumpHost {
 
 impl JumpHost {
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.name.trim().is_empty(), "跳板机名称不能为空");
+        anyhow::ensure!(!self.name.trim().is_empty(), "服务器名称不能为空");
         anyhow::ensure!(!self.host.trim().is_empty(), "SSH 服务地址不能为空");
         anyhow::ensure!(self.port > 0, "SSH 服务端口无效");
         anyhow::ensure!(!self.username.trim().is_empty(), "SSH 登录用户名不能为空");
@@ -107,7 +107,7 @@ impl ForwardConfig {
         anyhow::ensure!(!self.remote_ip.trim().is_empty(), "远程 IP 不能为空");
         anyhow::ensure!(self.remote_port > 0, "远程端口无效");
         anyhow::ensure!(self.local_port > 0, "本地端口无效");
-        anyhow::ensure!(!self.jump_host_id.is_empty(), "请选择跳板机");
+        anyhow::ensure!(!self.jump_host_id.is_empty(), "请选择服务器");
         if self.keep_alive {
             anyhow::ensure!(
                 (2..=3600).contains(&self.keep_alive_interval_secs),

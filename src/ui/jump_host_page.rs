@@ -53,13 +53,13 @@ impl JumpHostTableDelegate {
                     .max_width(px(260.)),
                 Column::new("actions", "操作")
                     .p_0()
-                    .width(px(240.))
-                    .min_width(px(220.))
-                    .max_width(px(380.))
+                    .width(px(160.))
+                    .min_width(px(140.))
+                    .max_width(px(240.))
                     .selectable(false),
             ],
             rows: Vec::new(),
-            empty_message: "暂无跳板机，点击右上角新增".into(),
+            empty_message: "暂无服务器，点击右上角新增".into(),
         }
     }
 
@@ -145,17 +145,19 @@ impl TableDelegate for JumpHostTableDelegate {
             _ => {
                 let connect_view = self.view.clone();
                 let edit_view = self.view.clone();
+                let copy_view = self.view.clone();
                 let delete_view = self.view.clone();
                 let connect_id = host.id.clone();
                 let edit_id = host.id.clone();
+                let copy_id = host.id.clone();
                 let delete_id = host.id.clone();
                 cell.gap_1()
                     .child(
                         Button::new(format!("connect-host-{}", host.id))
-                            .small()
-                            .primary()
+                            .xsmall()
+                            .ghost()
                             .icon(IconName::SquareTerminal)
-                            .label("连接")
+                            .tooltip("连接服务器")
                             .on_click(move |_, window, cx| {
                                 let _ = connect_view.update(cx, |this, cx| {
                                     this.open_ssh_connection(&connect_id, window, cx)
@@ -164,10 +166,10 @@ impl TableDelegate for JumpHostTableDelegate {
                     )
                     .child(
                         Button::new(format!("edit-host-{}", host.id))
-                            .small()
-                            .outline()
+                            .xsmall()
+                            .ghost()
                             .icon(IconName::Settings2)
-                            .label("编辑")
+                            .tooltip("编辑服务器")
                             .on_click(move |_, window, cx| {
                                 if let Some(view) = edit_view.upgrade() {
                                     open_edit_dialog(view, edit_id.clone(), window, cx);
@@ -175,11 +177,23 @@ impl TableDelegate for JumpHostTableDelegate {
                             }),
                     )
                     .child(
+                        Button::new(format!("copy-host-{}", host.id))
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .tooltip("复制服务器")
+                            .on_click(move |_, window, cx| {
+                                if let Some(view) = copy_view.upgrade() {
+                                    open_copy_dialog(view, copy_id.clone(), window, cx);
+                                }
+                            }),
+                    )
+                    .child(
                         Button::new(format!("delete-host-{}", host.id))
-                            .small()
-                            .danger()
+                            .xsmall()
+                            .ghost()
                             .icon(Icon::default().path("icons/trash-2.svg"))
-                            .label("删除")
+                            .tooltip("删除服务器")
                             .on_click(move |_, window, cx| {
                                 let id = delete_id.clone();
                                 let _ = delete_view.update(cx, |this, cx| {
@@ -207,7 +221,7 @@ impl TableDelegate for JumpHostTableDelegate {
 
 fn form_inputs(view: &AppView) -> Vec<FormInput> {
     vec![
-        ("跳板机名称", view.jump_host_form.name.clone(), false, true),
+        ("服务器名称", view.jump_host_form.name.clone(), false, true),
         (
             "SSH 地址 / 域名",
             view.jump_host_form.host.clone(),
@@ -283,9 +297,9 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
                     DialogHeader::new()
                         .p_5()
                         .child(DialogTitle::new().child(if is_editing {
-                            "编辑跳板机"
+                            "编辑服务器"
                         } else {
-                            "新增跳板机"
+                            "新增服务器"
                         }))
                         .child(
                             div()
@@ -318,7 +332,7 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
                         .children(inputs.iter().map(|(label, state, password, required)| {
                             v_flex()
                                 .gap_1()
-                                .when(*label == "跳板机名称", |field| field.col_span_full())
+                                .when(*label == "服务器名称", |field| field.col_span_full())
                                 .child(
                                     h_flex()
                                         .gap_1()
@@ -386,7 +400,7 @@ fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoEleme
             Button::new("add-jump-host")
                 .primary()
                 .icon(IconName::Plus)
-                .label("新增跳板机")
+                .label("新增服务器")
                 .on_click(move |_, window, cx| {
                     reset_view.update(cx, |this, cx| this.prepare_new_jump_host(window, cx));
                 }),
@@ -398,6 +412,16 @@ fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoEleme
 
 fn open_edit_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: &mut App) {
     if !view.update(cx, |this, cx| this.prepare_edit_jump_host(&id, window, cx)) {
+        return;
+    }
+    let inputs = form_inputs(view.read(cx));
+    window.open_dialog(cx, move |dialog, _, _| {
+        configure_dialog(dialog, view.clone(), inputs.clone())
+    });
+}
+
+fn open_copy_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: &mut App) {
+    if !view.update(cx, |this, cx| this.prepare_copy_jump_host(&id, window, cx)) {
         return;
     }
     let inputs = form_inputs(view.read(cx));
@@ -442,9 +466,9 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
         })
         .collect();
     let empty_message = if view_state.jump_hosts.is_empty() {
-        "暂无跳板机，点击右上角新增"
+        "暂无服务器，点击右上角新增"
     } else {
-        "没有符合搜索条件的跳板机"
+        "没有符合搜索条件的服务器"
     };
     view_state.jump_host_table.update(cx, |table, cx| {
         table.delegate_mut().update_rows(rows, empty_message.into());
@@ -461,7 +485,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                 .child(
                     v_flex()
                         .gap_1()
-                        .child(div().text_2xl().font_semibold().child("跳板机"))
+                        .child(div().text_2xl().font_semibold().child("服务器"))
                         .child(
                             div()
                                 .text_sm()

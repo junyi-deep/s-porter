@@ -57,7 +57,7 @@ impl ForwardTableDelegate {
                     .width(px(170.))
                     .min_width(px(110.))
                     .max_width(px(360.)),
-                Column::new("jump_host", "跳板机")
+                Column::new("jump_host", "服务器")
                     .p_0()
                     .width(px(190.))
                     .min_width(px(120.))
@@ -373,7 +373,7 @@ fn configure_form_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<Form
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("转发目标通过已保存的跳板机建立 SSH 隧道。"),
+                                .child("转发目标通过已保存的服务器建立 SSH 隧道。"),
                         ),
                 )
                 .child(
@@ -384,7 +384,7 @@ fn configure_form_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<Form
                         .child(
                             h_flex()
                                 .gap_1()
-                                .child(div().text_sm().font_medium().child("选择跳板机"))
+                                .child(div().text_sm().font_medium().child("选择服务器"))
                                 .child(
                                     div()
                                         .text_sm()
@@ -534,7 +534,7 @@ fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoEleme
                 .label("新增配置")
                 .disabled(view_state.jump_hosts.is_empty())
                 .tooltip(if view_state.jump_hosts.is_empty() {
-                    "请先新增跳板机"
+                    "请先新增服务器"
                 } else {
                     "新增本地转发配置"
                 })
@@ -589,7 +589,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                     host.name, host.username, host.host, host.port
                 )
             })
-            .unwrap_or_else(|| "跳板机已不存在".into())
+            .unwrap_or_else(|| "服务器已不存在".into())
     };
     let state_of = |item: &crate::forward::ForwardConfig| {
         if view_state

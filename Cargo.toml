@@ -30,5 +30,6 @@ serde_json = "1"
 sha2 = "0.10"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 urlencoding = "2"
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.16"
