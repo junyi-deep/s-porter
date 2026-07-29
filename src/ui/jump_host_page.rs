@@ -275,19 +275,29 @@ fn form_inputs(view: &AppView) -> Vec<FormInput> {
     ]
 }
 
-fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput>) -> Dialog {
+fn configure_dialog(
+    dialog: Dialog,
+    view: Entity<AppView>,
+    inputs: Vec<FormInput>,
+    is_batch: bool,
+) -> Dialog {
     let keyboard_save_view = view.clone();
     let button_save_view = view.clone();
     let test_view = view.clone();
     dialog
         .width(px(820.))
         .on_ok(move |_, window, cx| {
-            keyboard_save_view.update(cx, |this, cx| this.save_jump_host(window, cx))
+            keyboard_save_view.update(cx, |this, cx| {
+                this.jump_host_batch_mode = is_batch;
+                this.save_jump_host(window, cx)
+            })
         })
         .p_0()
         .content(move |content, _, cx| {
             let view_state = view.read(cx);
             let is_editing = view_state.editing_jump_host_id.is_some();
+            let batch_entries = view_state.jump_host_form.batch_entries.clone();
+            let batch_separator = view_state.jump_host_form.batch_separator.clone();
             let form_error = view_state.jump_host_form_error.clone();
             let test_view = test_view.clone();
             let save_view = button_save_view.clone();
@@ -298,6 +308,8 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
                         .p_5()
                         .child(DialogTitle::new().child(if is_editing {
                             "编辑服务器"
+                        } else if is_batch {
+                            "批量新增服务器"
                         } else {
                             "新增服务器"
                         }))
@@ -305,7 +317,11 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child("登录用户和 root 用户的用户名、密码均为必填项。"),
+                                .child(if is_batch {
+                                    "每行输入服务器名称和 SSH 地址，默认支持逗号、Tab、空格或自定义分隔符；其它配置由本批次共用。"
+                                } else {
+                                    "登录用户和 root 用户的用户名、密码均为必填项。"
+                                }),
                         ),
                 )
                 .when_some(form_error, |content, error| {
@@ -321,6 +337,41 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
                             .child(error),
                     )
                 })
+                .when(is_batch, |content| {
+                    content.child(
+                        v_flex()
+                            .mx_5()
+                            .mb_4()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(div().text_sm().font_medium().child("服务器列表"))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_bold()
+                                            .text_color(cx.theme().danger)
+                                            .child("*"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .h(px(150.))
+                                    .child(Input::new(&batch_entries).h_full()),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_sm()
+                                    .font_medium()
+                                    .child("自定义分隔符（可选）"),
+                            )
+                            .child(
+                                Input::new(&batch_separator),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .grid()
@@ -329,44 +380,59 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
                         .gap_y_3()
                         .px_5()
                         .pb_5()
-                        .children(inputs.iter().map(|(label, state, password, required)| {
-                            v_flex()
-                                .gap_1()
-                                .when(*label == "服务器名称", |field| field.col_span_full())
-                                .child(
-                                    h_flex()
+                        .children(
+                            inputs
+                                .iter()
+                                .filter(|(label, _, _, _)| {
+                                    !is_batch
+                                        || !matches!(*label, "服务器名称" | "SSH 地址 / 域名")
+                                })
+                                .map(|(label, state, password, required)| {
+                                    v_flex()
                                         .gap_1()
-                                        .child(div().text_sm().font_medium().child(*label))
-                                        .when(*required, |element| {
-                                            element.child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_bold()
-                                                    .text_color(cx.theme().danger)
-                                                    .child("*"),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    Input::new(state).when(*password, |input| input.mask_toggle()),
-                                )
-                        })),
+                                        .when(*label == "服务器名称", |field| {
+                                            field.col_span_full()
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(
+                                                    div().text_sm().font_medium().child(*label),
+                                                )
+                                                .when(*required, |element| {
+                                                    element.child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_bold()
+                                                            .text_color(cx.theme().danger)
+                                                            .child("*"),
+                                                    )
+                                                }),
+                                        )
+                                        .child(Input::new(state).when(*password, |input| {
+                                            input.mask_toggle()
+                                        }))
+                                }),
+                        ),
                 )
                 .child(
                     DialogFooter::new()
                         .p_4()
                         .bg(cx.theme().muted)
                         .justify_between()
-                        .child(
-                            Button::new("test-jump-host")
-                                .outline()
-                                .label("测试连通性")
-                                .on_click(move |_, window, cx| {
-                                    test_view.update(cx, |this, cx| {
-                                        this.test_jump_host_form(window, cx)
-                                    });
-                                }),
-                        )
+                        .when(!is_batch, |footer| {
+                            footer.child(
+                                Button::new("test-jump-host")
+                                    .outline()
+                                    .label("测试连通性")
+                                    .on_click(move |_, window, cx| {
+                                        test_view.update(cx, |this, cx| {
+                                            this.test_jump_host_form(window, cx)
+                                        });
+                                    }),
+                            )
+                        })
+                        .when(is_batch, |footer| footer.child(div()))
                         .child(
                             h_flex()
                                 .gap_2()
@@ -381,6 +447,7 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
                                         .label("保存")
                                         .on_click(move |_, window, cx| {
                                             if save_view.update(cx, |this, cx| {
+                                                this.jump_host_batch_mode = is_batch;
                                                 this.save_jump_host(window, cx)
                                             }) {
                                                 window.close_dialog(cx);
@@ -395,7 +462,9 @@ fn configure_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput
 fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoElement {
     let view = cx.entity();
     let reset_view = view.clone();
-    configure_dialog(
+    let batch_view = view.clone();
+    let inputs = form_inputs(view_state);
+    let single = configure_dialog(
         Dialog::new(cx).trigger(
             Button::new("add-jump-host")
                 .primary()
@@ -405,9 +474,25 @@ fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoEleme
                     reset_view.update(cx, |this, cx| this.prepare_new_jump_host(window, cx));
                 }),
         ),
+        view.clone(),
+        inputs.clone(),
+        false,
+    );
+    let batch = configure_dialog(
+        Dialog::new(cx).trigger(
+            Button::new("batch-add-jump-host")
+                .outline()
+                .icon(IconName::Plus)
+                .label("批量新增服务器")
+                .on_click(move |_, window, cx| {
+                    batch_view.update(cx, |this, cx| this.prepare_batch_jump_hosts(window, cx));
+                }),
+        ),
         view,
-        form_inputs(view_state),
-    )
+        inputs,
+        true,
+    );
+    h_flex().gap_2().child(single).child(batch)
 }
 
 fn open_edit_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: &mut App) {
@@ -416,7 +501,7 @@ fn open_edit_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
     }
     let inputs = form_inputs(view.read(cx));
     window.open_dialog(cx, move |dialog, _, _| {
-        configure_dialog(dialog, view.clone(), inputs.clone())
+        configure_dialog(dialog, view.clone(), inputs.clone(), false)
     });
 }
 
@@ -426,7 +511,7 @@ fn open_copy_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
     }
     let inputs = form_inputs(view.read(cx));
     window.open_dialog(cx, move |dialog, _, _| {
-        configure_dialog(dialog, view.clone(), inputs.clone())
+        configure_dialog(dialog, view.clone(), inputs.clone(), false)
     });
 }
 

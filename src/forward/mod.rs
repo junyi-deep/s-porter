@@ -9,4 +9,7 @@ pub use sftp::{
     list_directory, parent_path, upload,
 };
 pub use ssh::{TunnelHandle, enable_forwarding, test_connection, test_jump_host_connection};
-pub use terminal::{SshTerminalControl, SshTerminalHandle, TerminalLine, TerminalTextStyle};
+pub use terminal::{
+    DEFAULT_TERMINAL_HISTORY_LINES, MAX_TERMINAL_HISTORY_LINES, MIN_TERMINAL_HISTORY_LINES,
+    SshTerminalControl, SshTerminalHandle, TerminalLine, TerminalTextStyle,
+};

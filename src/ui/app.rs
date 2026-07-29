@@ -19,7 +19,7 @@ use gpui_component::{
     text::TextView,
     *,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
@@ -30,6 +30,8 @@ use std::{
 use unicode_width::UnicodeWidthChar as _;
 
 const DEFAULT_UI_FONT_SIZE: f32 = 14.;
+const SSH_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const SSH_OUTPUT_FRAME_INTERVAL: Duration = Duration::from_millis(30);
 pub(super) const UI_FONT_SIZES: [u8; 15] =
     [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
 
@@ -91,6 +93,8 @@ impl ForwardForm {
 pub(super) struct JumpHostForm {
     pub(super) name: Entity<InputState>,
     pub(super) host: Entity<InputState>,
+    pub(super) batch_entries: Entity<InputState>,
+    pub(super) batch_separator: Entity<InputState>,
     pub(super) port: Entity<InputState>,
     pub(super) username: Entity<InputState>,
     pub(super) password: Entity<InputState>,
@@ -104,6 +108,15 @@ pub(super) struct JumpHostForm {
 
 impl JumpHostForm {
     fn new(window: &mut Window, cx: &mut Context<AppView>) -> Self {
+        let batch_entries = cx.new(|cx| {
+            InputState::new(window, cx).multi_line(true).placeholder(
+                "每行一台：服务器名称, SSH地址\n例如：\n生产-01, 10.0.0.11\n生产-02, 10.0.0.12",
+            )
+        });
+        let batch_separator = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("可选，例如：;（留空则自动识别逗号、Tab 或空格）")
+        });
         let mut input =
             |value: &'static str, placeholder: &'static str, cx: &mut Context<AppView>| {
                 cx.new(|cx| {
@@ -115,6 +128,8 @@ impl JumpHostForm {
         Self {
             name: input("", "例如：生产环境服务器", cx),
             host: input("", "SSH 服务器 IP 或域名", cx),
+            batch_entries,
+            batch_separator,
             port: input("22", "SSH 端口", cx),
             username: input("paas", "SSH 登录用户名", cx),
             password: input("", "SSH 登录密码", cx),
@@ -200,8 +215,10 @@ pub(super) struct SshTab {
     pub(super) terminal_scroll: UniformListScrollHandle,
     pub(super) terminal_focus: FocusHandle,
     pub(super) terminal_size: Rc<Cell<(u16, u16)>>,
+    pub(super) terminal_viewport_height: Rc<Cell<f32>>,
     pub(super) terminal_content_left: Rc<Cell<f32>>,
     pub(super) terminal_output_revision: u64,
+    pub(super) terminal_last_output_sync: Instant,
     pub(super) terminal_selection: Option<TerminalSelection>,
     pub(super) terminal_selecting: bool,
     pub(super) terminal_search: Entity<InputState>,
@@ -260,6 +277,48 @@ fn remember_command(history: &mut Vec<String>, command: &str) {
     history.truncate(500);
 }
 
+fn parse_jump_host_batch_entries(
+    value: &str,
+    custom_separator: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let custom_separator = match custom_separator {
+        "\\t" => Some("\t"),
+        value if value.trim().is_empty() => None,
+        value => Some(value),
+    };
+    let mut entries = Vec::new();
+    for (index, source) in value.lines().enumerate() {
+        let line = source.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let pair = if let Some(separator) = custom_separator {
+            line.split_once(separator)
+        } else {
+            [',', '，', '|', '\t']
+                .into_iter()
+                .find_map(|separator| line.split_once(separator))
+                .or_else(|| {
+                    line.char_indices()
+                        .rev()
+                        .find(|(_, character)| character.is_whitespace())
+                        .map(|(index, _)| line.split_at(index))
+                })
+        };
+        let Some((name, host)) = pair else {
+            anyhow::bail!("第 {} 行格式错误，请使用名称与 SSH 地址分隔符", index + 1);
+        };
+        let name = name.trim();
+        let host = host.trim();
+        anyhow::ensure!(!name.is_empty(), "第 {} 行服务器名称不能为空", index + 1);
+        anyhow::ensure!(!host.is_empty(), "第 {} 行 SSH 地址不能为空", index + 1);
+        entries.push((name.to_string(), host.to_string()));
+    }
+    anyhow::ensure!(!entries.is_empty(), "请至少输入一台服务器");
+    anyhow::ensure!(entries.len() <= 500, "单次最多批量新增 500 台服务器");
+    Ok(entries)
+}
+
 fn terminal_byte_offset(text: &str, column: usize) -> usize {
     let mut display_column = 0;
     for (offset, character) in text.char_indices() {
@@ -312,7 +371,6 @@ fn terminal_selected_text(
             selected.push('\n');
         }
     }
-    let selected = selected.replace('▏', "");
     (!selected.is_empty()).then_some(selected)
 }
 
@@ -356,6 +414,26 @@ fn terminal_key_bytes(
     if modifiers.platform {
         return None;
     }
+    // Tab 是 shell 补全键，必须先于 GPUI 的字符输入偏好处理。
+    // 否则某些平台会把 Tab 标记为 prefer_character_input，但不提供 key_char，
+    // 最终事件继续传播并触发界面焦点跳转。
+    if keystroke.key == "tab" {
+        return match modifiers {
+            Modifiers {
+                shift: true,
+                control: false,
+                alt: false,
+                ..
+            } => Some(b"\x1b[Z".to_vec()),
+            Modifiers {
+                shift: false,
+                control: false,
+                alt: false,
+                ..
+            } => Some(vec![b'\t']),
+            _ => None,
+        };
+    }
     if prefer_character_input {
         return keystroke
             .key_char
@@ -387,10 +465,6 @@ fn terminal_key_bytes(
     let no_modifiers = !modifiers.control && !modifiers.alt && !modifiers.shift;
     let cursor_prefix = if application_cursor { "\x1bO" } else { "\x1b[" };
     let value = match keystroke.key.as_str() {
-        "tab" if modifiers.shift && !modifiers.control && !modifiers.alt => {
-            Some("\x1b[Z".to_string())
-        }
-        "tab" if no_modifiers => Some("\t".to_string()),
         "escape" if no_modifiers => Some("\x1b".to_string()),
         "enter" if no_modifiers => Some("\r".to_string()),
         "enter" if modifiers.shift && !modifiers.control && !modifiers.alt => {
@@ -463,6 +537,7 @@ pub(super) struct AppView {
     pub(super) page: Page,
     pub(super) sidebar_collapsed: bool,
     ui_font_size: f32,
+    terminal_history_lines: usize,
     pub(super) jump_hosts: Vec<JumpHost>,
     pub(super) forwards: Vec<ForwardConfig>,
     pub(super) tunnels: HashMap<String, forward::TunnelHandle>,
@@ -474,6 +549,7 @@ pub(super) struct AppView {
     pub(super) jump_host_form: JumpHostForm,
     pub(super) jump_host_form_error: Option<String>,
     pub(super) editing_jump_host_id: Option<String>,
+    pub(super) jump_host_batch_mode: bool,
     pub(super) jump_host_search: Entity<InputState>,
     pub(super) ssh_host_picker_search: Entity<InputState>,
     pub(super) jump_host_table: Entity<TableState<jump_host_page::JumpHostTableDelegate>>,
@@ -562,6 +638,10 @@ impl AppView {
             }),
         ];
         let config = storage::load().unwrap_or_default();
+        let terminal_history_lines = config.terminal_history_lines.clamp(
+            forward::MIN_TERMINAL_HISTORY_LINES,
+            forward::MAX_TERMINAL_HISTORY_LINES,
+        );
         let selected_jump_host_id = config.jump_hosts.first().map(|host| host.id.clone());
         let command_history = config
             .command_history
@@ -572,6 +652,7 @@ impl AppView {
             page: Page::JumpHosts,
             sidebar_collapsed: false,
             ui_font_size: DEFAULT_UI_FONT_SIZE,
+            terminal_history_lines,
             jump_hosts: config.jump_hosts,
             forwards: config.forwards,
             tunnels: HashMap::new(),
@@ -583,6 +664,7 @@ impl AppView {
             jump_host_form: JumpHostForm::new(window, cx),
             jump_host_form_error: None,
             editing_jump_host_id: None,
+            jump_host_batch_mode: false,
             jump_host_search,
             ssh_host_picker_search,
             jump_host_table,
@@ -611,9 +693,6 @@ impl AppView {
                 if weak
                     .update_in(cx, |this, window, cx| {
                         this.tick_time_tools(window, cx);
-                        if this.page == Page::Ssh {
-                            cx.notify();
-                        }
                     })
                     .is_err()
                 {
@@ -625,7 +704,7 @@ impl AppView {
         cx.spawn_in(window, async move |weak, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(50))
+                    .timer(SSH_OUTPUT_POLL_INTERVAL)
                     .await;
                 if weak
                     .update_in(cx, |this, _, cx| this.sync_active_ssh_output(cx))
@@ -664,6 +743,24 @@ impl AppView {
             cx,
         );
         cx.notify();
+    }
+
+    pub(super) fn show_hint(
+        &mut self,
+        message: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = message.into();
+        let id = uuid::Uuid::new_v4().to_string();
+        window.push_notification(
+            Notification::new().content(move |_, _, _| {
+                TextView::markdown(format!("hint-{id}"), text.clone())
+                    .selectable(true)
+                    .into_any_element()
+            }),
+            cx,
+        );
     }
 
     fn set_ui_font_size(&mut self, font_size: f32, window: &mut Window, cx: &mut Context<Self>) {
@@ -723,6 +820,7 @@ impl AppView {
             forwards: self.forwards.clone(),
             quick_commands: self.quick_commands.clone(),
             command_history: self.command_history.clone(),
+            terminal_history_lines: self.terminal_history_lines,
         }
     }
 
@@ -761,7 +859,7 @@ impl AppView {
                 true
             }
             Err(error) => {
-                self.push_message(error.to_string(), window, cx);
+                self.show_hint(error.to_string(), window, cx);
                 false
             }
         }
@@ -875,10 +973,13 @@ impl AppView {
 
     pub(super) fn prepare_new_jump_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_jump_host_id = None;
+        self.jump_host_batch_mode = false;
         self.jump_host_form_error = None;
         let values = [
             (&self.jump_host_form.name, ""),
             (&self.jump_host_form.host, ""),
+            (&self.jump_host_form.batch_entries, ""),
+            (&self.jump_host_form.batch_separator, ""),
             (&self.jump_host_form.port, "22"),
             (&self.jump_host_form.username, "paas"),
             (&self.jump_host_form.password, ""),
@@ -894,6 +995,12 @@ impl AppView {
         }
     }
 
+    pub(super) fn prepare_batch_jump_hosts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_new_jump_host(window, cx);
+        self.jump_host_batch_mode = true;
+        cx.notify();
+    }
+
     pub(super) fn prepare_edit_jump_host(
         &mut self,
         id: &str,
@@ -905,6 +1012,7 @@ impl AppView {
         };
         let proxy = host.http_proxy.unwrap_or_default();
         self.editing_jump_host_id = Some(host.id);
+        self.jump_host_batch_mode = false;
         self.jump_host_form_error = None;
         let values = [
             (&self.jump_host_form.name, host.name),
@@ -950,6 +1058,7 @@ impl AppView {
         }
         let proxy = host.http_proxy.unwrap_or_default();
         self.editing_jump_host_id = None;
+        self.jump_host_batch_mode = false;
         self.jump_host_form_error = None;
         let values = [
             (&self.jump_host_form.name, copy_name),
@@ -977,7 +1086,13 @@ impl AppView {
         true
     }
 
-    fn jump_host_form_value(&self, cx: &App) -> anyhow::Result<JumpHost> {
+    fn jump_host_form_value_with_identity(
+        &self,
+        id: String,
+        name: String,
+        host: String,
+        cx: &App,
+    ) -> anyhow::Result<JumpHost> {
         let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
         let proxy_host = value(&self.jump_host_form.proxy_host);
         let http_proxy = if proxy_host.trim().is_empty() {
@@ -993,12 +1108,9 @@ impl AppView {
             })
         };
         let host = JumpHost {
-            id: self
-                .editing_jump_host_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            name: value(&self.jump_host_form.name),
-            host: value(&self.jump_host_form.host),
+            id,
+            name,
+            host,
             port: value(&self.jump_host_form.port)
                 .parse()
                 .map_err(|_| anyhow::anyhow!("SSH 端口必须是 1–65535 的数字"))?,
@@ -1012,27 +1124,77 @@ impl AppView {
         Ok(host)
     }
 
+    fn jump_host_form_value(&self, cx: &App) -> anyhow::Result<JumpHost> {
+        let value = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        self.jump_host_form_value_with_identity(
+            self.editing_jump_host_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            value(&self.jump_host_form.name),
+            value(&self.jump_host_form.host),
+            cx,
+        )
+    }
+
+    fn jump_host_batch_values(&self, cx: &App) -> anyhow::Result<Vec<JumpHost>> {
+        let source = self
+            .jump_host_form
+            .batch_entries
+            .read(cx)
+            .value()
+            .to_string();
+        let separator = self
+            .jump_host_form
+            .batch_separator
+            .read(cx)
+            .value()
+            .to_string();
+        let entries = parse_jump_host_batch_entries(&source, &separator)?;
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, host))| {
+                self.jump_host_form_value_with_identity(
+                    uuid::Uuid::new_v4().to_string(),
+                    name,
+                    host,
+                    cx,
+                )
+                .map_err(|error| anyhow::anyhow!("第 {} 行：{error}", index + 1))
+            })
+            .collect()
+    }
+
     pub(super) fn save_jump_host(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let host = match self.jump_host_form_value(cx) {
-            Ok(host) => host,
+        let hosts = match if self.jump_host_batch_mode {
+            self.jump_host_batch_values(cx)
+        } else {
+            self.jump_host_form_value(cx).map(|host| vec![host])
+        } {
+            Ok(hosts) => hosts,
             Err(error) => {
                 let message = error.to_string();
                 self.jump_host_form_error = Some(message.clone());
-                self.push_message(message, window, cx);
                 return false;
             }
         };
         let mut next = self.jump_hosts.clone();
-        if let Some(existing) = next.iter_mut().find(|item| item.id == host.id) {
-            *existing = host.clone();
+        if self.jump_host_batch_mode {
+            next.extend(hosts.iter().cloned());
         } else {
-            next.push(host.clone());
+            let host = &hosts[0];
+            if let Some(existing) = next.iter_mut().find(|item| item.id == host.id) {
+                *existing = host.clone();
+            } else {
+                next.push(host.clone());
+            }
         }
         let config = storage::AppConfig {
             jump_hosts: next.clone(),
             forwards: self.forwards.clone(),
             quick_commands: self.quick_commands.clone(),
             command_history: self.command_history.clone(),
+            terminal_history_lines: self.terminal_history_lines,
         };
         if let Err(error) = storage::save(&config) {
             let message = format!("保存失败：{error:#}");
@@ -1042,8 +1204,14 @@ impl AppView {
         }
         self.jump_host_form_error = None;
         self.jump_hosts = next;
-        self.selected_jump_host_id.get_or_insert(host.id);
-        self.push_message("服务器配置已保存", window, cx);
+        if let Some(host) = hosts.first() {
+            self.selected_jump_host_id.get_or_insert(host.id.clone());
+        }
+        if self.jump_host_batch_mode {
+            self.push_message(format!("已批量新增 {} 台服务器", hosts.len()), window, cx);
+        } else {
+            self.push_message("服务器配置已保存", window, cx);
+        }
         cx.notify();
         true
     }
@@ -1058,7 +1226,6 @@ impl AppView {
             Err(error) => {
                 let message = error.to_string();
                 self.jump_host_form_error = Some(message.clone());
-                self.push_message(message, window, cx);
                 return;
             }
         };
@@ -1167,6 +1334,7 @@ impl AppView {
                 .collect(),
             quick_commands: self.quick_commands.clone(),
             command_history: self.command_history.clone(),
+            terminal_history_lines: self.terminal_history_lines,
         };
         if let Err(error) = storage::save(&next) {
             self.push_message(format!("删除失败：{error:#}"), window, cx);
@@ -1263,12 +1431,15 @@ impl AppView {
             terminal_lines: Arc::new(vec![forward::TerminalLine {
                 text: "正在建立 SSH 连接…".into(),
                 styles: Vec::new(),
+                cursor_column: None,
             }]),
             terminal_scroll: UniformListScrollHandle::new(),
             terminal_focus: cx.focus_handle().tab_stop(true),
             terminal_size: Rc::new(Cell::new((120, 40))),
+            terminal_viewport_height: Rc::new(Cell::new(0.)),
             terminal_content_left: Rc::new(Cell::new(0.)),
             terminal_output_revision: 0,
+            terminal_last_output_sync: Instant::now() - SSH_OUTPUT_FRAME_INTERVAL,
             terminal_selection: None,
             terminal_selecting: false,
             terminal_search,
@@ -1293,10 +1464,16 @@ impl AppView {
         self.page = Page::Ssh;
         cx.notify();
 
+        let terminal_history_lines = self.terminal_history_lines;
         cx.spawn_in(window, async move |weak, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { forward::SshTerminalHandle::start(host) })
+                .spawn(async move {
+                    forward::SshTerminalHandle::start_with_history_limit(
+                        host,
+                        terminal_history_lines,
+                    )
+                })
                 .await;
             let _ = weak.update_in(cx, |this, window, cx| {
                 let Some(tab) = this.ssh_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
@@ -1314,6 +1491,7 @@ impl AppView {
                         tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
                             text: format!("SSH 连接失败：{message}"),
                             styles: Vec::new(),
+                            cursor_column: None,
                         }]);
                         this.push_message(format!("SSH 连接失败：{message}"), window, cx);
                     }
@@ -1343,20 +1521,25 @@ impl AppView {
         let Some(terminal) = tab.terminal.as_ref() else {
             return;
         };
+        if tab.terminal_last_output_sync.elapsed() < SSH_OUTPUT_FRAME_INTERVAL {
+            return;
+        }
         let Some((revision, output)) = terminal.output_if_changed(tab.terminal_output_revision)
         else {
             return;
         };
+        tab.terminal_last_output_sync = Instant::now();
         tab.terminal_output_revision = revision;
         tab.terminal_lines = if output.is_empty() {
             Arc::new(vec![forward::TerminalLine {
                 text: "终端输出已清空".into(),
                 styles: Vec::new(),
+                cursor_column: None,
             }])
         } else {
             Arc::new(output)
         };
-        tab.terminal_scroll.scroll_to_item_strict(
+        tab.terminal_scroll.scroll_to_item(
             tab.terminal_lines.len().saturating_sub(1),
             ScrollStrategy::Bottom,
         );
@@ -1364,21 +1547,55 @@ impl AppView {
     }
 
     pub(super) fn close_ssh_tab(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(tab) = self.ssh_tabs.iter().find(|tab| tab.id == id) {
-            for transfer in &tab.transfers {
-                if matches!(
-                    transfer.status,
-                    TransferStatus::Running | TransferStatus::Cancelling
-                ) {
-                    transfer.progress.cancel();
-                }
-            }
-        }
-        self.ssh_tabs.retain(|tab| tab.id != id);
+        let Some(index) = self.ssh_tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        Self::cancel_ssh_tab_transfers(&self.ssh_tabs[index]);
+        self.ssh_tabs.remove(index);
         if self.active_ssh_tab_id.as_deref() == Some(id) {
-            self.active_ssh_tab_id = self.ssh_tabs.last().map(|tab| tab.id.clone());
+            self.active_ssh_tab_id = self
+                .ssh_tabs
+                .get(index)
+                .or_else(|| {
+                    index
+                        .checked_sub(1)
+                        .and_then(|index| self.ssh_tabs.get(index))
+                })
+                .map(|tab| tab.id.clone());
         }
         cx.notify();
+    }
+
+    pub(super) fn close_other_ssh_tabs(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.ssh_tabs.iter().any(|tab| tab.id == id) {
+            return;
+        }
+        for tab in self.ssh_tabs.iter().filter(|tab| tab.id != id) {
+            Self::cancel_ssh_tab_transfers(tab);
+        }
+        self.ssh_tabs.retain(|tab| tab.id == id);
+        self.active_ssh_tab_id = Some(id.to_string());
+        cx.notify();
+    }
+
+    pub(super) fn close_all_ssh_tabs(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.ssh_tabs {
+            Self::cancel_ssh_tab_transfers(tab);
+        }
+        self.ssh_tabs.clear();
+        self.active_ssh_tab_id = None;
+        cx.notify();
+    }
+
+    fn cancel_ssh_tab_transfers(tab: &SshTab) {
+        for transfer in &tab.transfers {
+            if matches!(
+                transfer.status,
+                TransferStatus::Running | TransferStatus::Cancelling
+            ) {
+                transfer.progress.cancel();
+            }
+        }
     }
 
     pub(super) fn run_ssh_quick_command(
@@ -1404,15 +1621,41 @@ impl AppView {
                 self.record_command_history(command.trim_end(), window, cx);
                 self.ssh_tabs[tab_index].terminal_focus.focus(window, cx);
             }
-            Err(error) => self.push_message(error.to_string(), window, cx),
+            Err(error) => self.show_ssh_interaction_error(id, error.to_string(), cx),
         }
+    }
+
+    fn show_ssh_interaction_error(
+        &mut self,
+        id: &str,
+        message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh_tabs.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let mut lines = tab.terminal_lines.as_ref().clone();
+        lines.push(forward::TerminalLine {
+            text: format!("SSH 交互错误：{}", message.into()),
+            styles: Vec::new(),
+            cursor_column: None,
+        });
+        if lines.len() > self.terminal_history_lines {
+            lines.drain(..lines.len() - self.terminal_history_lines);
+        }
+        tab.terminal_lines = Arc::new(lines);
+        tab.terminal_scroll.scroll_to_item(
+            tab.terminal_lines.len().saturating_sub(1),
+            ScrollStrategy::Bottom,
+        );
+        cx.notify();
     }
 
     pub(super) fn send_ssh_keystroke(
         &mut self,
         id: &str,
         event: &KeyDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let copy_shortcut = if cfg!(target_os = "macos") {
@@ -1450,7 +1693,7 @@ impl AppView {
                 return true;
             };
             if let Err(error) = terminal.send_paste(&text) {
-                self.push_message(format!("SSH 粘贴失败：{error:#}"), window, cx);
+                self.show_ssh_interaction_error(id, format!("粘贴失败：{error:#}"), cx);
             }
             return true;
         }
@@ -1462,7 +1705,7 @@ impl AppView {
             return false;
         };
         if let Err(error) = terminal.send_bytes(bytes) {
-            self.push_message(format!("SSH 输入失败：{error:#}"), window, cx);
+            self.show_ssh_interaction_error(id, format!("输入失败：{error:#}"), cx);
             return false;
         }
         true
@@ -1606,6 +1849,36 @@ impl AppView {
         self.ui_font_size
     }
 
+    pub(super) fn terminal_history_lines(&self) -> usize {
+        self.terminal_history_lines
+    }
+
+    pub(super) fn set_terminal_history_lines(&mut self, lines: usize, cx: &mut Context<Self>) {
+        let lines = lines.clamp(
+            forward::MIN_TERMINAL_HISTORY_LINES,
+            forward::MAX_TERMINAL_HISTORY_LINES,
+        );
+        if self.terminal_history_lines == lines {
+            return;
+        }
+        let previous = self.terminal_history_lines;
+        self.terminal_history_lines = lines;
+        for tab in &self.ssh_tabs {
+            if let Some(terminal) = &tab.terminal {
+                terminal.set_history_limit(lines);
+            }
+        }
+        if storage::save(&self.app_config()).is_err() {
+            self.terminal_history_lines = previous;
+            for tab in &self.ssh_tabs {
+                if let Some(terminal) = &tab.terminal {
+                    terminal.set_history_limit(previous);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     pub(super) fn save_quick_command(
         &mut self,
         id: Option<&str>,
@@ -1617,7 +1890,7 @@ impl AppView {
         let name = name.trim();
         let command = command.trim();
         if name.is_empty() || command.is_empty() {
-            self.push_message("快捷命令名称和具体命令均不能为空", window, cx);
+            self.show_hint("快捷命令名称和具体命令均不能为空", window, cx);
             return false;
         }
         let previous = self.quick_commands.clone();
@@ -1681,6 +1954,7 @@ impl AppView {
         tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
             text: "终端输出已清空".into(),
             styles: Vec::new(),
+            cursor_column: None,
         }]);
         cx.notify();
     }
@@ -1707,17 +1981,25 @@ impl AppView {
         tab.state = SshConnectionState::Connecting;
         tab.terminal_size.set((0, 0));
         tab.terminal_output_revision = 0;
+        tab.terminal_last_output_sync = Instant::now() - SSH_OUTPUT_FRAME_INTERVAL;
         tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
             text: "正在重新建立 SSH 连接…".into(),
             styles: Vec::new(),
+            cursor_column: None,
         }]);
         let title = tab.title.clone();
         let tab_id = id.to_string();
         self.push_message(format!("正在重连 {title}"), window, cx);
+        let terminal_history_lines = self.terminal_history_lines;
         cx.spawn_in(window, async move |weak, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { forward::SshTerminalHandle::start(host) })
+                .spawn(async move {
+                    forward::SshTerminalHandle::start_with_history_limit(
+                        host,
+                        terminal_history_lines,
+                    )
+                })
                 .await;
             let _ = weak.update_in(cx, |this, window, cx| {
                 let Some(tab) = this.ssh_tabs.iter_mut().find(|tab| tab.id == tab_id) else {
@@ -1735,6 +2017,7 @@ impl AppView {
                         tab.terminal_lines = Arc::new(vec![forward::TerminalLine {
                             text: format!("SSH 重连失败：{message}"),
                             styles: Vec::new(),
+                            cursor_column: None,
                         }]);
                         this.push_message(format!("SSH 重连失败：{message}"), window, cx);
                     }
@@ -1918,7 +2201,7 @@ impl AppView {
                     };
                     if let Some(error) = validation_error {
                         create_view.update(cx, |this, cx| {
-                            this.push_message(error, window, cx);
+                            this.show_hint(error, window, cx);
                         });
                         return false;
                     }
@@ -2693,7 +2976,7 @@ impl AppView {
     ) {
         match self.form_config(cx) {
             Ok(item) => self.run_ssh_operation(item, enable, window, cx),
-            Err(error) => self.push_message(error.to_string(), window, cx),
+            Err(error) => self.show_hint(error.to_string(), window, cx),
         }
     }
 
@@ -2889,8 +3172,8 @@ impl Render for AppView {
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalPoint, TerminalSelection, remember_command, terminal_key_bytes,
-        terminal_search_matches, terminal_selected_text,
+        TerminalPoint, TerminalSelection, parse_jump_host_batch_entries, remember_command,
+        terminal_key_bytes, terminal_search_matches, terminal_selected_text,
     };
     use crate::forward::TerminalLine;
     use gpui::Keystroke;
@@ -2917,7 +3200,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_batch_jump_hosts_with_supported_separators() {
+        let entries = parse_jump_host_batch_entries(
+            "生产-01, 10.0.0.11\n生产-02，10.0.0.12\n测试机|ssh.example.com\n预发机\t10.0.0.13\n有空格的 名称 10.0.0.14",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ("生产-01".into(), "10.0.0.11".into()),
+                ("生产-02".into(), "10.0.0.12".into()),
+                ("测试机".into(), "ssh.example.com".into()),
+                ("预发机".into(), "10.0.0.13".into()),
+                ("有空格的 名称".into(), "10.0.0.14".into()),
+            ]
+        );
+        assert_eq!(
+            parse_jump_host_batch_entries("节点一::10.0.0.21", "::").unwrap(),
+            vec![("节点一".into(), "10.0.0.21".into())]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_batch_jump_host_line() {
+        let error = parse_jump_host_batch_entries("缺少分隔符", "").unwrap_err();
+        assert!(error.to_string().contains("第 1 行格式错误"));
+    }
+
+    #[test]
     fn terminal_keys_encode_control_and_full_screen_navigation() {
+        assert_eq!(
+            terminal_key_bytes(&Keystroke::parse("tab").unwrap(), false, true),
+            Some(vec![b'\t'])
+        );
+        assert_eq!(
+            terminal_key_bytes(&Keystroke::parse("shift-tab").unwrap(), false, true),
+            Some(b"\x1b[Z".to_vec())
+        );
         assert_eq!(
             terminal_key_bytes(&Keystroke::parse("ctrl-c").unwrap(), false, false),
             Some(vec![0x03])
@@ -2946,15 +3266,17 @@ mod tests {
             TerminalLine {
                 text: "alpha".into(),
                 styles: Vec::new(),
+                cursor_column: None,
             },
             TerminalLine {
-                text: "be▏ta".into(),
+                text: "beta".into(),
                 styles: Vec::new(),
+                cursor_column: Some(2),
             },
         ];
         let selection = TerminalSelection {
             anchor: TerminalPoint { line: 0, column: 2 },
-            cursor: TerminalPoint { line: 1, column: 5 },
+            cursor: TerminalPoint { line: 1, column: 4 },
         };
 
         assert_eq!(
@@ -2964,15 +3286,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_selection_preserves_a_real_cursor_like_glyph() {
+        let lines = vec![TerminalLine {
+            text: "a▏b".into(),
+            styles: Vec::new(),
+            cursor_column: None,
+        }];
+        let selection = TerminalSelection {
+            anchor: TerminalPoint { line: 0, column: 0 },
+            cursor: TerminalPoint { line: 0, column: 3 },
+        };
+
+        assert_eq!(
+            terminal_selected_text(&lines, selection).as_deref(),
+            Some("a▏b")
+        );
+    }
+
+    #[test]
     fn terminal_search_finds_all_case_insensitive_matches() {
         let lines = vec![
             TerminalLine {
                 text: "Ready then READY".into(),
                 styles: Vec::new(),
+                cursor_column: None,
             },
             TerminalLine {
                 text: "not here".into(),
                 styles: Vec::new(),
+                cursor_column: None,
             },
         ];
 

@@ -134,7 +134,7 @@ impl AppView {
                 set_input(&input, value, window, cx);
                 self.convert_datetime(window, cx);
             }
-            Err(error) => self.push_message(error.to_string(), window, cx),
+            Err(error) => self.show_hint(error.to_string(), window, cx),
         }
     }
 
@@ -165,7 +165,7 @@ impl AppView {
                     set_input(&state, value, window, cx);
                 }
             }
-            Err(error) => self.push_message(format!("转换失败：{error:#}"), window, cx),
+            Err(error) => self.show_hint(format!("转换失败：{error:#}"), window, cx),
         }
     }
 
@@ -190,7 +190,7 @@ impl AppView {
                 set_input(&datetime, value, window, cx);
                 self.convert_datetime(window, cx);
             }
-            Err(error) => self.push_message(format!("转换失败：{error:#}"), window, cx),
+            Err(error) => self.show_hint(format!("转换失败：{error:#}"), window, cx),
         }
     }
 
@@ -230,12 +230,12 @@ impl AppView {
                     cx,
                 ) {
                     Ok(0) => {
-                        self.push_message("倒计时时长必须大于 0", window, cx);
+                        self.show_hint("倒计时时长必须大于 0", window, cx);
                         return;
                     }
                     Ok(value) => self.time_tools.countdown_remaining = value,
                     Err(error) => {
-                        self.push_message(error.to_string(), window, cx);
+                        self.show_hint(error.to_string(), window, cx);
                         return;
                     }
                 }
@@ -256,7 +256,7 @@ impl AppView {
                 self.time_tools.countdown_remaining = value;
                 cx.notify();
             }
-            Err(error) => self.push_message(error.to_string(), window, cx),
+            Err(error) => self.show_hint(error.to_string(), window, cx),
         }
     }
 
@@ -302,7 +302,7 @@ impl AppView {
             match self.configured_pomodoro_cycles(cx) {
                 Ok(cycles) => self.time_tools.pomodoro_total_cycles = cycles,
                 Err(error) => {
-                    self.push_message(error.to_string(), window, cx);
+                    self.show_hint(error.to_string(), window, cx);
                     return;
                 }
             }
@@ -314,12 +314,12 @@ impl AppView {
             if self.time_tools.pomodoro_remaining == 0 {
                 match self.pomodoro_phase_seconds(cx) {
                     Ok(0) => {
-                        self.push_message("番茄时长必须大于 0", window, cx);
+                        self.show_hint("番茄时长必须大于 0", window, cx);
                         return;
                     }
                     Ok(value) => self.time_tools.pomodoro_remaining = value,
                     Err(error) => {
-                        self.push_message(error.to_string(), window, cx);
+                        self.show_hint(error.to_string(), window, cx);
                         return;
                     }
                 }
@@ -336,13 +336,13 @@ impl AppView {
         match self.configured_pomodoro_cycles(cx) {
             Ok(cycles) => self.time_tools.pomodoro_total_cycles = cycles,
             Err(error) => {
-                self.push_message(error.to_string(), window, cx);
+                self.show_hint(error.to_string(), window, cx);
                 return;
             }
         }
         match self.pomodoro_phase_seconds(cx) {
             Ok(value) => self.time_tools.pomodoro_remaining = value,
-            Err(error) => self.push_message(error.to_string(), window, cx),
+            Err(error) => self.show_hint(error.to_string(), window, cx),
         }
         cx.notify();
     }

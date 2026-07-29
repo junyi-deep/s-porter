@@ -18,7 +18,7 @@ pub struct QuickCommand {
     pub command: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub jump_hosts: Vec<JumpHost>,
@@ -28,6 +28,24 @@ pub struct AppConfig {
     pub quick_commands: Vec<QuickCommand>,
     #[serde(default)]
     pub command_history: Vec<String>,
+    #[serde(default = "default_terminal_history_lines")]
+    pub terminal_history_lines: usize,
+}
+
+fn default_terminal_history_lines() -> usize {
+    crate::forward::DEFAULT_TERMINAL_HISTORY_LINES
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            jump_hosts: Vec::new(),
+            forwards: Vec::new(),
+            quick_commands: Vec::new(),
+            command_history: Vec::new(),
+            terminal_history_lines: default_terminal_history_lines(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -161,6 +179,10 @@ mod tests {
         let config: AppConfig = serde_json::from_str(r#"{"jump_hosts":[],"forwards":[]}"#).unwrap();
         assert!(config.quick_commands.is_empty());
         assert!(config.command_history.is_empty());
+        assert_eq!(
+            config.terminal_history_lines,
+            crate::forward::DEFAULT_TERMINAL_HISTORY_LINES
+        );
     }
 
     fn legacy_forward(name: &str, local_port: u16) -> LegacyForwardConfig {

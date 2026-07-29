@@ -14,11 +14,11 @@ use gpui_component::{
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     progress::Progress,
     resizable::{h_resizable, resizable_panel},
-    scroll::{ScrollableElement, Scrollbar, ScrollbarShow},
+    scroll::ScrollableElement,
     tooltip::Tooltip,
     *,
 };
-use std::path::PathBuf;
+use std::{cell::Cell, path::PathBuf, rc::Rc};
 use unicode_width::UnicodeWidthChar as _;
 
 fn open_quick_command_dialog(
@@ -174,8 +174,13 @@ fn render_tabs(
     let tabs = view_state.ssh_tabs.iter().map(|tab| {
         let activate_view = view.clone();
         let close_view = view.clone();
+        let close_menu_view = view.clone();
+        let close_others_view = view.clone();
+        let close_all_view = view.clone();
         let activate_id = tab.id.clone();
         let close_id = tab.id.clone();
+        let close_menu_id = tab.id.clone();
+        let close_others_id = tab.id.clone();
         let is_active = active_id.as_deref() == Some(tab.id.as_str());
         let tab_text_color = if is_active {
             cx.theme().button_primary_foreground
@@ -193,6 +198,29 @@ fn render_tabs(
             })
             .when(is_active, |tab| tab.bg(cx.theme().primary))
             .overflow_hidden()
+            .context_menu(move |menu, _, _| {
+                menu.item(PopupMenuItem::new("关闭").on_click({
+                    let view = close_menu_view.clone();
+                    let id = close_menu_id.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| this.close_ssh_tab(&id, cx));
+                    }
+                }))
+                .item(PopupMenuItem::new("关闭其它").on_click({
+                    let view = close_others_view.clone();
+                    let id = close_others_id.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| this.close_other_ssh_tabs(&id, cx));
+                    }
+                }))
+                .separator()
+                .item(PopupMenuItem::new("关闭所有").on_click({
+                    let view = close_all_view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| this.close_all_ssh_tabs(cx));
+                    }
+                }))
+            })
             .child(
                 Button::new(format!("ssh-tab-{}", tab.id))
                     .small()
@@ -211,7 +239,7 @@ fn render_tabs(
                     .ghost()
                     .text_color(tab_text_color)
                     .icon(IconName::Close)
-                    .tooltip("关闭连接")
+                    .tooltip("关闭连接；右键页签可关闭其它或全部")
                     .on_click(move |_, _, cx| {
                         close_view.update(cx, |this, cx| this.close_ssh_tab(&close_id, cx));
                     }),
@@ -304,14 +332,131 @@ fn terminal_selection_range(
     (!range.is_empty()).then_some(range)
 }
 
-fn terminal_column(position_x: Pixels, content_left: f32, font_size: f32) -> usize {
-    ((f32::from(position_x) - content_left - 8.).max(0.) / (font_size * 0.62)).floor() as usize
+const TERMINAL_CURSOR_GLYPH: char = '▏';
+
+fn terminal_text_with_cursor(
+    line: &crate::forward::TerminalLine,
+) -> (String, Option<std::ops::Range<usize>>) {
+    let Some(cursor_column) = line.cursor_column else {
+        return (line.text.clone(), None);
+    };
+    let cursor_offset = terminal_byte_offset(&line.text, cursor_column);
+    let mut text = line.text.clone();
+    text.insert(cursor_offset, TERMINAL_CURSOR_GLYPH);
+    let cursor_end = cursor_offset + TERMINAL_CURSOR_GLYPH.len_utf8();
+    (text, Some(cursor_offset..cursor_end))
+}
+
+fn terminal_display_range(
+    range: std::ops::Range<usize>,
+    cursor_range: Option<&std::ops::Range<usize>>,
+) -> std::ops::Range<usize> {
+    let Some(cursor) = cursor_range else {
+        return range;
+    };
+    let cursor_len = cursor.len();
+    let start = range.start + usize::from(range.start >= cursor.start) * cursor_len;
+    let end = range.end + usize::from(range.end > cursor.start) * cursor_len;
+    start..end
+}
+
+fn terminal_column(
+    position_x: Pixels,
+    content_left: f32,
+    font_size: f32,
+    line: &crate::forward::TerminalLine,
+    window: &mut Window,
+) -> usize {
+    let (display_text, _) = terminal_text_with_cursor(line);
+    let text = SharedString::from(display_text);
+    let shaped = window.text_system().shape_line(
+        text.clone(),
+        px(font_size),
+        &[TextRun {
+            len: text.len(),
+            font: font("monospace"),
+            color: transparent_black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }],
+        None,
+    );
+    let x = px((f32::from(position_x) - content_left - 8.).max(0.));
+    let byte_offset = shaped.closest_index_for_x(x).min(text.len());
+    let visual_column = terminal_display_width(&text[..byte_offset]);
+    match line.cursor_column {
+        Some(cursor_column) if visual_column > cursor_column => visual_column - 1,
+        _ => visual_column,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalScrollbarMetrics {
+    viewport_height: f32,
+    thumb_height: f32,
+    thumb_top: f32,
+    max_scroll: f32,
+}
+
+fn terminal_scrollbar_metrics(
+    line_count: usize,
+    line_height: f32,
+    viewport_height: f32,
+    offset_y: f32,
+) -> Option<TerminalScrollbarMetrics> {
+    let viewport_height = viewport_height.max(line_height);
+    let content_height = line_count.max(1) as f32 * line_height;
+    if content_height <= viewport_height {
+        return None;
+    }
+    let max_scroll = content_height - viewport_height;
+    let thumb_height =
+        (viewport_height * viewport_height / content_height).clamp(48., viewport_height);
+    let thumb_travel = (viewport_height - thumb_height).max(0.);
+    let scroll_offset = (-offset_y).clamp(0., max_scroll);
+    let thumb_top = if max_scroll <= f32::EPSILON {
+        0.
+    } else {
+        scroll_offset / max_scroll * thumb_travel
+    };
+    Some(TerminalScrollbarMetrics {
+        viewport_height,
+        thumb_height,
+        thumb_top,
+        max_scroll,
+    })
+}
+
+fn set_terminal_scroll_from_thumb(
+    handle: &UniformListScrollHandle,
+    metrics: TerminalScrollbarMetrics,
+    thumb_top: f32,
+    track_height: f32,
+) {
+    let scale = if metrics.viewport_height <= f32::EPSILON {
+        1.
+    } else {
+        track_height / metrics.viewport_height
+    };
+    let thumb_height = (metrics.thumb_height * scale).clamp(0., track_height);
+    let thumb_travel = (track_height - thumb_height).max(0.);
+    let thumb_top = thumb_top.clamp(0., thumb_travel);
+    let scroll_offset = if thumb_travel <= f32::EPSILON {
+        0.
+    } else {
+        thumb_top / thumb_travel * metrics.max_scroll
+    };
+    let base_handle = handle.0.borrow().base_handle.clone();
+    let current_offset = base_handle.offset();
+    base_handle.set_offset(point(current_offset.x, px(-scroll_offset)));
 }
 
 fn render_terminal(
     tab: &SshTab,
     quick_commands: &[crate::storage::QuickCommand],
     global_font_size: f32,
+    terminal_history_lines: usize,
     view: &Entity<AppView>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
@@ -349,16 +494,17 @@ fn render_terminal(
     let terminal_control: Option<crate::forward::SshTerminalControl> =
         tab.terminal.as_ref().map(|terminal| terminal.control());
     let terminal_size_state = tab.terminal_size.clone();
+    let terminal_viewport_height = tab.terminal_viewport_height.clone();
     let terminal_content_left = tab.terminal_content_left.clone();
     let terminal_left_for_resize = terminal_content_left.clone();
     let terminal_left_for_lines = terminal_content_left.clone();
     let font_size_view = view.clone();
     let font_size_tab_id = tab.id.clone();
+    let history_lines_view = view.clone();
     let custom_font_size = tab.terminal_font_size;
     let terminal_font_size = custom_font_size.unwrap_or(global_font_size);
     let terminal_selection = tab.terminal_selection;
     let terminal_scroll_for_selection = tab.terminal_scroll.clone();
-    let terminal_scrollbar = tab.terminal_scroll.clone();
     let terminal_search_query = tab.terminal_search.read(cx).value().to_string();
     let terminal_search_matches = std::sync::Arc::new(super::app::terminal_search_matches(
         &tab.terminal_lines,
@@ -565,6 +711,33 @@ fn render_terminal(
                                 }),
                         )
                         .child(
+                            Button::new(format!("ssh-history-lines-{}", tab.id))
+                                .xsmall()
+                                .ghost()
+                                .label(format!("保留 {terminal_history_lines} 行"))
+                                .dropdown_caret(true)
+                                .tooltip("设置 SSH 交互信息保留行数")
+                                .dropdown_menu(move |menu, _, _| {
+                                    [100, 500, 1_000, 2_000, 5_000, 10_000].into_iter().fold(
+                                        menu,
+                                        |menu, lines| {
+                                            let view = history_lines_view.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(format!("{lines} 行"))
+                                                    .checked(terminal_history_lines == lines)
+                                                    .on_click(move |_, _, cx| {
+                                                        view.update(cx, |this, cx| {
+                                                            this.set_terminal_history_lines(
+                                                                lines, cx,
+                                                            )
+                                                        });
+                                                    }),
+                                            )
+                                        },
+                                    )
+                                }),
+                        )
+                        .child(
                             Button::new(format!("ssh-reconnect-{}", tab.id))
                                 .xsmall()
                                 .ghost()
@@ -582,7 +755,8 @@ fn render_terminal(
                                 .xsmall()
                                 .ghost()
                                 .icon(IconName::Delete)
-                                .tooltip("清空终端内容")
+                                .label("清屏")
+                                .tooltip("清空当前 SSH 交互内容")
                                 .on_click(move |_, window, cx| {
                                     clear_view.update(cx, |this, cx| {
                                         this.clear_ssh_terminal(&clear_id, window, cx)
@@ -614,11 +788,34 @@ fn render_terminal(
         .child(div().flex_1().min_h_0().p_2().bg(rgb(0xffffff)).child({
             let terminal_lines = tab.terminal_lines.clone();
             let line_count = terminal_lines.len();
-            let terminal_scroll_size = size(
-                px(1.),
-                px(terminal_font_size * 1.45 * line_count.max(1) as f32),
+            let line_height = terminal_font_size * 1.45;
+            let viewport_height = tab
+                .terminal_viewport_height
+                .get()
+                .max(f32::from(tab.terminal_size.get().1) * line_height);
+            let terminal_offset_y =
+                f32::from(tab.terminal_scroll.0.borrow().base_handle.offset().y);
+            let scrollbar_metrics = terminal_scrollbar_metrics(
+                line_count,
+                line_height,
+                viewport_height,
+                terminal_offset_y,
             );
+            let scrollbar_handle_down = tab.terminal_scroll.clone();
+            let scrollbar_handle_move = tab.terminal_scroll.clone();
+            let scrollbar_track_bounds = Rc::new(Cell::new((0_f32, viewport_height)));
+            let scrollbar_track_bounds_for_paint = scrollbar_track_bounds.clone();
+            let scrollbar_track_bounds_for_down = scrollbar_track_bounds.clone();
+            let scrollbar_track_bounds_for_move = scrollbar_track_bounds.clone();
+            let scrollbar_grab_offset = Rc::new(Cell::new(0_f32));
+            let scrollbar_grab_offset_for_down = scrollbar_grab_offset.clone();
+            let scrollbar_grab_offset_for_move = scrollbar_grab_offset.clone();
             let terminal_search_matches = terminal_search_matches.clone();
+            let terminal_selection_color = cx.theme().selection.opacity(0.65);
+            let scrollbar_track_color = cx.theme().scrollbar;
+            let scrollbar_border_color = cx.theme().border;
+            let scrollbar_thumb_color = cx.theme().tokens.scrollbar_thumb;
+            let scrollbar_thumb_hover_color = cx.theme().tokens.scrollbar_thumb_hover;
             div()
                 .id(format!("ssh-terminal-input-{}", tab.id))
                 .relative()
@@ -644,6 +841,7 @@ fn render_terminal(
                 })
                 .on_prepaint(move |bounds, _, _| {
                     terminal_left_for_resize.set(f32::from(bounds.origin.x));
+                    terminal_viewport_height.set(f32::from(bounds.size.height));
                     let Some(control) = terminal_control.as_ref() else {
                         return;
                     };
@@ -665,8 +863,16 @@ fn render_terminal(
                             range
                                 .map(|index| {
                                     let line = &terminal_lines[index];
+                                    let (display_text, cursor_range) =
+                                        terminal_text_with_cursor(line);
                                     let base_highlights = line.styles.iter().map(|span| {
-                                        (span.range.clone(), terminal_highlight(span.style))
+                                        (
+                                            terminal_display_range(
+                                                span.range.clone(),
+                                                cursor_range.as_ref(),
+                                            ),
+                                            terminal_highlight(span.style),
+                                        )
                                     });
                                     let search_highlights = terminal_search_matches
                                         .iter()
@@ -676,7 +882,10 @@ fn render_terminal(
                                                 .as_ref()
                                                 .is_some_and(|active| active == matched);
                                             (
-                                                matched.range.clone(),
+                                                terminal_display_range(
+                                                    matched.range.clone(),
+                                                    cursor_range.as_ref(),
+                                                ),
                                                 HighlightStyle {
                                                     background_color: Some(
                                                         rgb(if is_active {
@@ -700,19 +909,28 @@ fn render_terminal(
                                     )
                                     .map(|range| {
                                         (
+                                            terminal_display_range(range, cursor_range.as_ref()),
+                                            HighlightStyle {
+                                                background_color: Some(terminal_selection_color),
+                                                ..HighlightStyle::default()
+                                            },
+                                        )
+                                    });
+                                    let cursor_highlight = cursor_range.clone().map(|range| {
+                                        (
                                             range,
                                             HighlightStyle {
-                                                background_color: Some(
-                                                    rgb(0x93c5fd).opacity(0.65).into(),
-                                                ),
+                                                color: Some(rgb(0x111827).into()),
                                                 ..HighlightStyle::default()
                                             },
                                         )
                                     });
                                     let highlights =
                                         combine_highlights(base_highlights, search_highlights);
-                                    let highlights = combine_highlights(highlights, selected)
-                                        .collect::<Vec<_>>();
+                                    let highlights = combine_highlights(highlights, selected);
+                                    let highlights =
+                                        combine_highlights(highlights, cursor_highlight)
+                                            .collect::<Vec<_>>();
                                     let begin_view = terminal_select_view.clone();
                                     let update_view = terminal_select_view.clone();
                                     let select_id = terminal_select_id.clone();
@@ -721,6 +939,8 @@ fn render_terminal(
                                     let update_content_left = terminal_left_for_lines.clone();
                                     let begin_scroll = terminal_scroll_for_selection.clone();
                                     let update_scroll = terminal_scroll_for_selection.clone();
+                                    let begin_line = line.clone();
+                                    let update_line = line.clone();
                                     div()
                                         .h(px(terminal_font_size * 1.45))
                                         .min_w_full()
@@ -731,27 +951,32 @@ fn render_terminal(
                                         .text_color(rgb(0x111827))
                                         .whitespace_nowrap()
                                         .cursor_text()
-                                        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                                            let column = terminal_column(
-                                                event.position.x,
-                                                content_left.get()
-                                                    + f32::from(
-                                                        begin_scroll
-                                                            .0
-                                                            .borrow()
-                                                            .base_handle
-                                                            .offset()
-                                                            .x,
-                                                    ),
-                                                terminal_font_size,
-                                            );
-                                            begin_view.update(cx, |this, cx| {
-                                                this.begin_ssh_terminal_selection(
-                                                    &select_id, index, column, cx,
-                                                )
-                                            });
-                                        })
-                                        .on_mouse_move(move |event, _, cx| {
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |event, window, cx| {
+                                                let column = terminal_column(
+                                                    event.position.x,
+                                                    content_left.get()
+                                                        + f32::from(
+                                                            begin_scroll
+                                                                .0
+                                                                .borrow()
+                                                                .base_handle
+                                                                .offset()
+                                                                .x,
+                                                        ),
+                                                    terminal_font_size,
+                                                    &begin_line,
+                                                    window,
+                                                );
+                                                begin_view.update(cx, |this, cx| {
+                                                    this.begin_ssh_terminal_selection(
+                                                        &select_id, index, column, cx,
+                                                    )
+                                                });
+                                            },
+                                        )
+                                        .on_mouse_move(move |event, window, cx| {
                                             if !event.dragging() {
                                                 return;
                                             }
@@ -767,6 +992,8 @@ fn render_terminal(
                                                             .x,
                                                     ),
                                                 terminal_font_size,
+                                                &update_line,
+                                                window,
                                             );
                                             update_view.update(cx, |this, cx| {
                                                 this.update_ssh_terminal_selection(
@@ -775,7 +1002,7 @@ fn render_terminal(
                                             });
                                         })
                                         .child(
-                                            StyledText::new(line.text.clone())
+                                            StyledText::new(display_text)
                                                 .with_highlights(highlights),
                                         )
                                 })
@@ -784,13 +1011,79 @@ fn render_terminal(
                     )
                     .track_scroll(&tab.terminal_scroll)
                     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                    .pr(px(16.))
                     .size_full(),
                 )
                 .child(
-                    Scrollbar::vertical(&terminal_scrollbar)
-                        .id(format!("ssh-terminal-scrollbar-{}", tab.id))
-                        .scroll_size(terminal_scroll_size)
-                        .scrollbar_show(ScrollbarShow::Always),
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(16.))
+                        .border_l_1()
+                        .border_color(scrollbar_border_color)
+                        .bg(scrollbar_track_color)
+                        .on_prepaint(move |bounds, _, _| {
+                            scrollbar_track_bounds_for_paint
+                                .set((f32::from(bounds.origin.y), f32::from(bounds.size.height)));
+                        })
+                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                            let Some(metrics) = scrollbar_metrics else {
+                                return;
+                            };
+                            let (track_top, track_height) = scrollbar_track_bounds_for_down.get();
+                            let scale = track_height / metrics.viewport_height;
+                            let thumb_height = metrics.thumb_height * scale;
+                            let thumb_top = metrics.thumb_top * scale;
+                            let pointer = f32::from(event.position.y) - track_top;
+                            let grab_offset =
+                                if pointer >= thumb_top && pointer <= thumb_top + thumb_height {
+                                    pointer - thumb_top
+                                } else {
+                                    thumb_height / 2.
+                                };
+                            scrollbar_grab_offset_for_down.set(grab_offset);
+                            set_terminal_scroll_from_thumb(
+                                &scrollbar_handle_down,
+                                metrics,
+                                pointer - grab_offset,
+                                track_height,
+                            );
+                            window.refresh();
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_move(move |event, window, cx| {
+                            if !event.dragging() {
+                                return;
+                            }
+                            let Some(metrics) = scrollbar_metrics else {
+                                return;
+                            };
+                            let (track_top, track_height) = scrollbar_track_bounds_for_move.get();
+                            let pointer = f32::from(event.position.y) - track_top;
+                            set_terminal_scroll_from_thumb(
+                                &scrollbar_handle_move,
+                                metrics,
+                                pointer - scrollbar_grab_offset_for_move.get(),
+                                track_height,
+                            );
+                            window.refresh();
+                            cx.stop_propagation();
+                        })
+                        .when_some(scrollbar_metrics, |track, metrics| {
+                            track.child(
+                                div()
+                                    .absolute()
+                                    .right(px(4.))
+                                    .top(px(metrics.thumb_top))
+                                    .w(px(8.))
+                                    .h(px(metrics.thumb_height))
+                                    .rounded_full()
+                                    .bg(scrollbar_thumb_color)
+                                    .hover(move |style| style.bg(scrollbar_thumb_hover_color)),
+                            )
+                        }),
                 )
                 .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                     terminal_finish_view.update(cx, |this, cx| {
@@ -1695,6 +1988,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                                 tab,
                                 &view_state.quick_commands,
                                 view_state.ui_font_size(),
+                                view_state.terminal_history_lines(),
                                 &view,
                                 cx,
                             ),
@@ -1719,6 +2013,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                         tab,
                         &view_state.quick_commands,
                         view_state.ui_font_size(),
+                        view_state.terminal_history_lines(),
                         &view,
                         cx,
                     )))
@@ -1743,8 +2038,12 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteSortField, sorted_remote_entries};
-    use crate::forward::RemoteEntry;
+    use super::{
+        RemoteSortField, set_terminal_scroll_from_thumb, sorted_remote_entries,
+        terminal_display_range, terminal_scrollbar_metrics, terminal_text_with_cursor,
+    };
+    use crate::forward::{RemoteEntry, TerminalLine};
+    use gpui::UniformListScrollHandle;
 
     fn entry(name: &str, modified_at: u64) -> RemoteEntry {
         RemoteEntry {
@@ -1779,5 +2078,44 @@ mod tests {
         assert_eq!(by_time[1].name, "..");
         assert_eq!(by_time[2].name, "beta");
         assert_eq!(by_time[3].name, "alpha");
+    }
+
+    #[test]
+    fn terminal_scrollbar_uses_content_rows_and_current_offset() {
+        assert!(terminal_scrollbar_metrics(10, 20., 200., 0.).is_none());
+
+        let middle = terminal_scrollbar_metrics(100, 20., 200., -900.).unwrap();
+        assert_eq!(middle.max_scroll, 1_800.);
+        assert_eq!(middle.thumb_height, 48.);
+        assert_eq!(middle.thumb_top, 76.);
+
+        let bottom = terminal_scrollbar_metrics(100, 20., 200., -1_800.).unwrap();
+        assert_eq!(bottom.thumb_top, 152.);
+    }
+
+    #[test]
+    fn dragging_terminal_scrollbar_updates_uniform_list_offset() {
+        let handle = UniformListScrollHandle::new();
+        let metrics = terminal_scrollbar_metrics(100, 20., 200., 0.).unwrap();
+
+        set_terminal_scroll_from_thumb(&handle, metrics, 76., 200.);
+
+        assert_eq!(f32::from(handle.0.borrow().base_handle.offset().y), -900.);
+    }
+
+    #[test]
+    fn visual_cursor_does_not_shift_terminal_selection_ranges() {
+        let line = TerminalLine {
+            text: "beta".into(),
+            styles: Vec::new(),
+            cursor_column: Some(2),
+        };
+
+        let (display, cursor) = terminal_text_with_cursor(&line);
+        assert_eq!(display, "be▏ta");
+        assert_eq!(cursor, Some(2..5));
+
+        let selected = terminal_display_range(2..4, cursor.as_ref());
+        assert_eq!(&display[selected], "ta");
     }
 }
