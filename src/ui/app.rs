@@ -2198,6 +2198,7 @@ impl AppView {
                 }
                 Err(error) => Err(anyhow::Error::new(error).context("无法启动上传线程")),
             };
+            progress.finish();
             let _ = weak.update_in(cx, |this, window, cx| {
                 let cancelled = progress.is_cancelled();
                 if let Some(transfer) = this
@@ -2322,13 +2323,27 @@ impl AppView {
         let tab_id = id.to_string();
         cx.spawn_in(window, async move |weak, cx| {
             let task_progress = progress.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
+            let worker = std::thread::Builder::new()
+                .name("s-porter-sftp-download".into())
+                .spawn(move || {
                     forward::download(&host, &entry.path, entry.is_dir, &target, &task_progress)
                         .map(|count| (count, target))
-                })
-                .await;
+                });
+            let result = match worker {
+                Ok(worker) => {
+                    while !worker.is_finished() {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                        let _ = weak.update_in(cx, |_, _, cx| cx.notify());
+                    }
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("下载线程意外终止")))
+                }
+                Err(error) => Err(anyhow::Error::new(error).context("无法启动下载线程")),
+            };
+            progress.finish();
             let _ = weak.update_in(cx, |this, window, cx| {
                 let cancelled = progress.is_cancelled();
                 if let Some(transfer) = this

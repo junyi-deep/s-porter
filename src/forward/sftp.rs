@@ -8,9 +8,19 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
-const TRANSFER_BUFFER_SIZE: usize = 64 * 1024;
+const TRANSFER_BUFFER_SIZE: usize = 256 * 1024;
+const PROGRESS_UPDATE_BYTES: u64 = 1024 * 1024;
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransferStage {
+    #[default]
+    Scanning,
+    Transferring,
+}
 
 #[derive(Clone, Debug)]
 pub struct RemoteEntry {
@@ -35,6 +45,35 @@ pub struct TransferSnapshot {
     pub files: Vec<TransferFileProgress>,
     pub total_bytes: u64,
     pub transferred_bytes: u64,
+    pub stage: TransferStage,
+    transfer_started_at: Option<Instant>,
+    transfer_finished_at: Option<Instant>,
+}
+
+impl TransferSnapshot {
+    pub fn bytes_per_second(&self) -> f64 {
+        let Some(started_at) = self.transfer_started_at else {
+            return 0.;
+        };
+        let elapsed = self
+            .transfer_finished_at
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(started_at)
+            .as_secs_f64();
+        if elapsed <= f64::EPSILON {
+            0.
+        } else {
+            self.transferred_bytes as f64 / elapsed
+        }
+    }
+
+    pub fn remaining_seconds(&self) -> Option<u64> {
+        let speed = self.bytes_per_second();
+        if speed <= 0. || self.total_bytes <= self.transferred_bytes {
+            return None;
+        }
+        Some(((self.total_bytes - self.transferred_bytes) as f64 / speed).ceil() as u64)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -78,6 +117,18 @@ impl TransferProgress {
                 .collect();
             snapshot.total_bytes = snapshot.files.iter().map(|file| file.size).sum();
             snapshot.transferred_bytes = 0;
+            snapshot.stage = TransferStage::Transferring;
+            snapshot.transfer_started_at = Some(Instant::now());
+            snapshot.transfer_finished_at = None;
+        }
+    }
+
+    pub fn finish(&self) {
+        if let Ok(mut snapshot) = self.snapshot.lock()
+            && snapshot.transfer_started_at.is_some()
+            && snapshot.transfer_finished_at.is_none()
+        {
+            snapshot.transfer_finished_at = Some(Instant::now());
         }
     }
 
@@ -320,6 +371,7 @@ pub fn download(
         &sftp,
         remote_path,
         is_dir,
+        None,
         local_path,
         &mut manifest,
         progress,
@@ -432,6 +484,7 @@ fn collect_remote_manifest(
     sftp: &ssh2::Sftp,
     remote_path: &str,
     is_dir: bool,
+    known_size: Option<u64>,
     local_path: &Path,
     manifest: &mut Vec<TransferManifestEntry>,
     progress: &TransferProgress,
@@ -457,6 +510,7 @@ fn collect_remote_manifest(
                 sftp,
                 &remote_join(remote_path, &name),
                 stat.is_dir(),
+                stat.size,
                 &local_path.join(name.as_ref()),
                 manifest,
                 progress,
@@ -464,11 +518,14 @@ fn collect_remote_manifest(
         }
         return Ok(());
     }
-    let size = sftp
-        .stat(Path::new(remote_path))
-        .with_context(|| format!("读取远程文件信息失败：{remote_path}"))?
-        .size
-        .unwrap_or(0);
+    let size = match known_size {
+        Some(size) => size,
+        None => sftp
+            .stat(Path::new(remote_path))
+            .with_context(|| format!("读取远程文件信息失败：{remote_path}"))?
+            .size
+            .unwrap_or(0),
+    };
     manifest.push(TransferManifestEntry {
         local_path: local_path.to_path_buf(),
         remote_path: remote_path.to_string(),
@@ -485,15 +542,33 @@ fn copy_with_progress(
     progress: &TransferProgress,
     file_index: usize,
 ) -> Result<()> {
-    let mut buffer = [0_u8; TRANSFER_BUFFER_SIZE];
+    let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
+    let mut pending_progress = 0_u64;
+    let mut last_progress_update = Instant::now();
     loop {
-        progress.check_cancelled()?;
+        if progress.is_cancelled() {
+            if pending_progress > 0 {
+                progress.advance(file_index, pending_progress);
+            }
+            progress.check_cancelled()?;
+        }
+        if pending_progress > 0
+            && (pending_progress >= PROGRESS_UPDATE_BYTES
+                || last_progress_update.elapsed() >= PROGRESS_UPDATE_INTERVAL)
+        {
+            progress.advance(file_index, pending_progress);
+            pending_progress = 0;
+            last_progress_update = Instant::now();
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         writer.write_all(&buffer[..read])?;
-        progress.advance(file_index, read as u64);
+        pending_progress = pending_progress.saturating_add(read as u64);
+    }
+    if pending_progress > 0 {
+        progress.advance(file_index, pending_progress);
     }
     writer.flush()?;
     Ok(())
@@ -504,6 +579,8 @@ mod tests {
     use super::*;
     use crate::forward::HttpProxyConfig;
     use std::io::Cursor;
+
+    const INTEGRATION_TRANSFER_SIZE: usize = 8 * 1024 * 1024;
 
     struct CancellingWriter {
         bytes: Vec<u8>,
@@ -617,7 +694,7 @@ mod tests {
         fs::write(source.join("visible.txt"), b"visible-content").unwrap();
         fs::write(
             source.join("large.bin"),
-            vec![7_u8; TRANSFER_BUFFER_SIZE * 32],
+            vec![7_u8; INTEGRATION_TRANSFER_SIZE],
         )
         .unwrap();
         let host = JumpHost {
@@ -662,7 +739,7 @@ mod tests {
         assert_eq!(fs::read(target.join(".hidden")).unwrap(), b"hidden-content");
         assert_eq!(
             download_progress.snapshot().transferred_bytes,
-            (b"hidden-content".len() + b"visible-content".len() + TRANSFER_BUFFER_SIZE * 32) as u64
+            (b"hidden-content".len() + b"visible-content".len() + INTEGRATION_TRANSFER_SIZE) as u64
         );
         delete_entry(&host, &remote_dir, true).unwrap();
         let (_, tmp_entries) = list_directory(&host, "/tmp").unwrap();

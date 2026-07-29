@@ -2,6 +2,7 @@ use super::app::{
     AppView, RemoteSortField, SshConnectionState, SshFilePanelView, SshTab, TerminalSelection,
     TransferDirection, TransferStatus, UI_FONT_SIZES,
 };
+use crate::forward::TransferStage;
 use gpui::InteractiveElement as _;
 use gpui::StatefulInteractiveElement as _;
 use gpui::prelude::FluentBuilder as _;
@@ -858,6 +859,16 @@ fn format_size(size: u64) -> String {
     }
 }
 
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds} 秒")
+    } else if seconds < 3_600 {
+        format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+    } else {
+        format!("{} 小时 {} 分", seconds / 3_600, seconds % 3_600 / 60)
+    }
+}
+
 fn render_transfer_panel(
     tab: &SshTab,
     view: &Entity<AppView>,
@@ -875,7 +886,10 @@ fn render_transfer_panel(
             snapshot.transferred_bytes as f32 * 100. / snapshot.total_bytes as f32
         };
         let (status, status_color) = match &transfer.status {
-            TransferStatus::Running => ("进行中", cx.theme().primary),
+            TransferStatus::Running if snapshot.stage == TransferStage::Scanning => {
+                ("扫描中", cx.theme().primary)
+            }
+            TransferStatus::Running => ("传输中", cx.theme().primary),
             TransferStatus::Cancelling => ("正在取消", cx.theme().warning),
             TransferStatus::Completed => ("已完成", cx.theme().success),
             TransferStatus::Cancelled => ("已取消", cx.theme().muted_foreground),
@@ -884,6 +898,18 @@ fn render_transfer_panel(
         let cancel_view = view.clone();
         let cancel_tab_id = tab.id.clone();
         let cancel_transfer_id = transfer.id.clone();
+        let speed = snapshot.bytes_per_second();
+        let transfer_detail = if snapshot.stage == TransferStage::Scanning {
+            "正在扫描文件…".to_string()
+        } else if speed > 0. {
+            let eta = snapshot
+                .remaining_seconds()
+                .map(format_duration)
+                .unwrap_or_else(|| "-".into());
+            format!("{}/s，预计剩余 {eta}", format_size(speed as u64))
+        } else {
+            "正在准备传输…".to_string()
+        };
         let files = snapshot.files.iter().map(|file| {
             let file_percentage = if file.size == 0 {
                 if file.completed { 100. } else { 0. }
@@ -991,7 +1017,14 @@ fn render_transfer_panel(
                         "{} / {}（{percentage:.0}%）",
                         format_size(snapshot.transferred_bytes),
                         format_size(snapshot.total_bytes)
-                    ))
+                    )),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(transfer_detail)
                     .child(format!(
                         "开始 {}  结束 {}",
                         transfer.started_at,
