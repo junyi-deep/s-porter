@@ -15,6 +15,7 @@ use gpui_component::{
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     resizable::{h_resizable, resizable_panel},
+    scroll::ScrollableElement,
     table::TableState,
     text::TextView,
     *,
@@ -569,6 +570,7 @@ pub(super) struct AppView {
     pub(super) forward_states: HashMap<String, ForwardState>,
     pub(super) startup_logs: HashMap<String, Vec<String>>,
     pub(super) selected: HashSet<String>,
+    pub(super) selected_jump_hosts: HashSet<String>,
     busy: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -684,6 +686,7 @@ impl AppView {
             forward_states: HashMap::new(),
             startup_logs: HashMap::new(),
             selected: HashSet::new(),
+            selected_jump_hosts: HashSet::new(),
             busy: false,
             _subscriptions: subscriptions,
         };
@@ -1258,78 +1261,144 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(host) = self.jump_hosts.iter().find(|host| host.id == id) else {
+        self.request_delete_jump_hosts(vec![id], window, cx);
+    }
+
+    pub(super) fn request_delete_selected_jump_hosts(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = self
+            .jump_hosts
+            .iter()
+            .filter(|host| self.selected_jump_hosts.contains(&host.id))
+            .map(|host| host.id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            self.show_hint("请先选择要删除的服务器", window, cx);
             return;
-        };
+        }
+        self.request_delete_jump_hosts(ids, window, cx);
+    }
+
+    fn request_delete_jump_hosts(
+        &self,
+        ids: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids_set = ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let hosts = self
+            .jump_hosts
+            .iter()
+            .filter(|host| ids_set.contains(host.id.as_str()))
+            .collect::<Vec<_>>();
+        if hosts.is_empty() {
+            return;
+        }
+        let host_lines = hosts
+            .iter()
+            .map(|host| format!("- 服务器：{}（{}:{}）", host.name, host.host, host.port));
         let forward_names = self
             .forwards
             .iter()
-            .filter(|item| item.jump_host_id == id)
-            .map(|item| format!("- 本地转发：{}", item.name));
+            .filter(|item| ids_set.contains(item.jump_host_id.as_str()))
+            .map(|item| format!("- 关联本地转发：{}", item.name));
         let connection_names = self
             .ssh_tabs
             .iter()
-            .filter(|tab| tab.jump_host_id == id)
-            .map(|tab| format!("- SSH 连接页签：{}", tab.title));
-        let associated = forward_names.chain(connection_names).collect::<Vec<_>>();
-        let details = if associated.is_empty() {
-            "没有关联的 SSH 连接或本地转发配置。".to_string()
+            .filter(|tab| ids_set.contains(tab.jump_host_id.as_str()))
+            .map(|tab| format!("- 关联 SSH 连接页签：{}", tab.title));
+        let details = host_lines
+            .chain(forward_names)
+            .chain(connection_names)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let title = if hosts.len() == 1 {
+            format!("确认删除服务器“{}”？", hosts[0].name)
         } else {
-            format!(
-                "删除后将同时停止并删除以下关联项：\n\n{}",
-                associated.join("\n")
-            )
+            format!("确认批量删除 {} 台服务器？", hosts.len())
         };
-        let title = format!("确认删除服务器“{}”？", host.name);
         let view = cx.entity();
         window.open_dialog(cx, move |dialog, _, _| {
-            let delete_id = id.clone();
+            let delete_ids = ids.clone();
             let delete_view = view.clone();
             dialog
                 .title(title.clone())
-                .w(px(560.))
+                .w(px(620.))
                 .footer(
                     DialogFooter::new()
                         .child(
                             DialogClose::new()
                                 .child(Button::new("cancel-delete-host").outline().label("取消")),
                         )
+                        .child(DialogAction::new().child(
+                            Button::new("confirm-delete-host").danger().label(
+                                if delete_ids.len() > 1 {
+                                    "确认批量删除"
+                                } else {
+                                    "确认删除"
+                                },
+                            ),
+                        )),
+                )
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child("删除后将同时停止并清理以下关联项：")
                         .child(
-                            DialogAction::new().child(
-                                Button::new("confirm-delete-host")
-                                    .danger()
-                                    .label("确认删除"),
+                            div().max_h(px(480.)).overflow_y_scrollbar().child(
+                                TextView::markdown(
+                                    format!("delete-jump-hosts-{}", delete_ids.join("-")),
+                                    details.clone(),
+                                )
+                                .selectable(true),
                             ),
                         ),
                 )
-                .child(
-                    TextView::markdown(format!("delete-jump-host-{delete_id}"), details.clone())
-                        .selectable(true),
-                )
                 .on_ok(move |_, window, cx| {
-                    delete_view.update(cx, |this, cx| this.delete_jump_host(&delete_id, window, cx))
+                    delete_view.update(cx, |this, cx| {
+                        this.delete_jump_hosts(&delete_ids, window, cx)
+                    })
                 })
         });
     }
 
-    fn delete_jump_host(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn delete_jump_hosts(
+        &mut self,
+        ids: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let ids_set = ids.iter().map(String::as_str).collect::<HashSet<_>>();
         let forward_ids = self
             .forwards
             .iter()
-            .filter(|item| item.jump_host_id == id)
+            .filter(|item| ids_set.contains(item.jump_host_id.as_str()))
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
+        let connection_count = self
+            .ssh_tabs
+            .iter()
+            .filter(|tab| ids_set.contains(tab.jump_host_id.as_str()))
+            .count();
+        let active_tab_survives = self.active_ssh_tab_id.as_deref().is_some_and(|active_id| {
+            self.ssh_tabs
+                .iter()
+                .any(|tab| tab.id == active_id && !ids_set.contains(tab.jump_host_id.as_str()))
+        });
         let next = storage::AppConfig {
             jump_hosts: self
                 .jump_hosts
                 .iter()
-                .filter(|host| host.id != id)
+                .filter(|host| !ids_set.contains(host.id.as_str()))
                 .cloned()
                 .collect(),
             forwards: self
                 .forwards
                 .iter()
-                .filter(|item| item.jump_host_id != id)
+                .filter(|item| !ids_set.contains(item.jump_host_id.as_str()))
                 .cloned()
                 .collect(),
             quick_commands: self.quick_commands.clone(),
@@ -1348,17 +1417,35 @@ impl AppView {
             self.startup_logs.remove(forward_id);
             self.selected.remove(forward_id);
         }
-        self.ssh_tabs.retain(|tab| tab.jump_host_id != id);
+        for tab in self
+            .ssh_tabs
+            .iter()
+            .filter(|tab| ids_set.contains(tab.jump_host_id.as_str()))
+        {
+            Self::cancel_ssh_tab_transfers(tab);
+        }
+        self.ssh_tabs
+            .retain(|tab| !ids_set.contains(tab.jump_host_id.as_str()));
         self.jump_hosts = next.jump_hosts;
         self.forwards = next.forwards;
-        self.active_ssh_tab_id = self.ssh_tabs.last().map(|tab| tab.id.clone());
-        if self.selected_jump_host_id.as_deref() == Some(id) {
+        if !active_tab_survives {
+            self.active_ssh_tab_id = self.ssh_tabs.last().map(|tab| tab.id.clone());
+        }
+        self.selected_jump_hosts
+            .retain(|id| !ids_set.contains(id.as_str()));
+        if self
+            .selected_jump_host_id
+            .as_deref()
+            .is_some_and(|id| ids_set.contains(id))
+        {
             self.selected_jump_host_id = self.jump_hosts.first().map(|host| host.id.clone());
         }
         self.push_message(
             format!(
-                "服务器已删除，同时清理 {} 个本地转发和相关 SSH 连接",
-                forward_ids.len()
+                "已删除 {} 台服务器，同时清理 {} 个本地转发和 {} 个 SSH 连接",
+                ids_set.len(),
+                forward_ids.len(),
+                connection_count
             ),
             window,
             cx,
@@ -2693,6 +2780,36 @@ impl AppView {
             self.selected.insert(id.to_string());
         } else {
             self.selected.remove(id);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_jump_host_selected(
+        &mut self,
+        id: &str,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if selected {
+            self.selected_jump_hosts.insert(id.to_string());
+        } else {
+            self.selected_jump_hosts.remove(id);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn select_jump_host_ids(
+        &mut self,
+        ids: &[String],
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if selected {
+            self.selected_jump_hosts.extend(ids.iter().cloned());
+        } else {
+            for id in ids {
+                self.selected_jump_hosts.remove(id);
+            }
         }
         cx.notify();
     }

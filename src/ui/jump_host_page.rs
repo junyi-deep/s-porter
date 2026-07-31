@@ -3,6 +3,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     dialog::{Dialog, DialogClose, DialogFooter, DialogHeader, DialogTitle},
     input::{Input, InputState},
     table::{Column, DataTable, TableDelegate, TableState},
@@ -17,12 +18,15 @@ struct JumpHostTableRow {
     host: crate::forward::JumpHost,
     forward_count: usize,
     connection_count: usize,
+    selected: bool,
 }
 
 pub(super) struct JumpHostTableDelegate {
     view: WeakEntity<AppView>,
     columns: Vec<Column>,
     rows: Vec<JumpHostTableRow>,
+    visible_ids: Vec<String>,
+    all_selected: bool,
     empty_message: String,
 }
 
@@ -31,6 +35,12 @@ impl JumpHostTableDelegate {
         Self {
             view: view.downgrade(),
             columns: vec![
+                Column::new("selected", "")
+                    .p_0()
+                    .width(px(44.))
+                    .min_width(px(40.))
+                    .max_width(px(64.))
+                    .selectable(false),
                 Column::new("name", "名称")
                     .p_0()
                     .width(px(180.))
@@ -59,12 +69,22 @@ impl JumpHostTableDelegate {
                     .selectable(false),
             ],
             rows: Vec::new(),
+            visible_ids: Vec::new(),
+            all_selected: false,
             empty_message: "暂无服务器，点击右上角新增".into(),
         }
     }
 
-    fn update_rows(&mut self, rows: Vec<JumpHostTableRow>, empty_message: String) {
+    fn update_rows(
+        &mut self,
+        rows: Vec<JumpHostTableRow>,
+        visible_ids: Vec<String>,
+        all_selected: bool,
+        empty_message: String,
+    ) {
         self.rows = rows;
+        self.visible_ids = visible_ids;
+        self.all_selected = all_selected;
         self.empty_message = empty_message;
     }
 }
@@ -88,7 +108,7 @@ impl TableDelegate for JumpHostTableDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        div()
+        let header = div()
             .size_full()
             .flex()
             .items_center()
@@ -97,8 +117,27 @@ impl TableDelegate for JumpHostTableDelegate {
             .border_r_1()
             .border_color(cx.theme().table_row_border)
             .text_xs()
-            .font_semibold()
-            .child(self.columns[col_ix].name.clone())
+            .font_semibold();
+        if col_ix == 0 {
+            let select_view = self.view.clone();
+            let visible_ids = self.visible_ids.clone();
+            header
+                .child(
+                    Checkbox::new("select-all-jump-hosts")
+                        .checked(self.all_selected)
+                        .tooltip("全选当前列表")
+                        .on_click(move |selected, _, cx| {
+                            let _ = select_view.update(cx, |this, cx| {
+                                this.select_jump_host_ids(&visible_ids, *selected, cx)
+                            });
+                        }),
+                )
+                .into_any_element()
+        } else {
+            header
+                .child(self.columns[col_ix].name.clone())
+                .into_any_element()
+        }
     }
 
     fn render_td(
@@ -119,13 +158,27 @@ impl TableDelegate for JumpHostTableDelegate {
             .border_color(cx.theme().table_row_border)
             .text_sm();
         match col_ix {
-            0 => cell
+            0 => {
+                let select_view = self.view.clone();
+                let id = host.id.clone();
+                cell.child(
+                    Checkbox::new(format!("select-jump-host-{}", host.id))
+                        .checked(row.selected)
+                        .on_click(move |selected, _, cx| {
+                            let _ = select_view.update(cx, |this, cx| {
+                                this.toggle_jump_host_selected(&id, *selected, cx)
+                            });
+                        }),
+                )
+                .into_any_element()
+            }
+            1 => cell
                 .child(
                     TextView::markdown(format!("host-name-{}", host.id), host.name)
                         .selectable(true),
                 )
                 .into_any_element(),
-            1 => cell
+            2 => cell
                 .child(
                     TextView::markdown(
                         format!("host-address-{}", host.id),
@@ -134,8 +187,8 @@ impl TableDelegate for JumpHostTableDelegate {
                     .selectable(true),
                 )
                 .into_any_element(),
-            2 => cell.child(host.username).into_any_element(),
-            3 => cell
+            3 => cell.child(host.username).into_any_element(),
+            4 => cell
                 .text_color(cx.theme().muted_foreground)
                 .child(format!(
                     "{} 转发 / {} 连接",
@@ -516,6 +569,7 @@ fn open_copy_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
 }
 
 pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+    let view = cx.entity();
     let dialog = add_dialog(view_state, cx).into_any_element();
     let search = view_state
         .jump_host_search
@@ -534,6 +588,17 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                 || host.root_username.to_lowercase().contains(&search)
         })
         .collect::<Vec<_>>();
+    let visible_ids = filtered
+        .iter()
+        .map(|host| host.id.clone())
+        .collect::<Vec<_>>();
+    let all_selected = !visible_ids.is_empty()
+        && visible_ids
+            .iter()
+            .all(|id| view_state.selected_jump_hosts.contains(id));
+    let filtered_len = filtered.len();
+    let has_selection = !view_state.selected_jump_hosts.is_empty();
+    let delete_selected_view = view.clone();
     let rows = filtered
         .into_iter()
         .map(|host| JumpHostTableRow {
@@ -548,6 +613,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                 .iter()
                 .filter(|tab| tab.jump_host_id == host.id)
                 .count(),
+            selected: view_state.selected_jump_hosts.contains(&host.id),
         })
         .collect();
     let empty_message = if view_state.jump_hosts.is_empty() {
@@ -556,7 +622,9 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
         "没有符合搜索条件的服务器"
     };
     view_state.jump_host_table.update(cx, |table, cx| {
-        table.delegate_mut().update_rows(rows, empty_message.into());
+        table
+            .delegate_mut()
+            .update_rows(rows, visible_ids, all_selected, empty_message.into());
         cx.notify();
     });
 
@@ -580,9 +648,42 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                 )
                 .child(dialog),
         )
-        .child(div().w(px(380.)).child(
-            Input::new(&view_state.jump_host_search).prefix(Icon::new(IconName::Search).small()),
-        ))
+        .child(
+            h_flex()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div().w(px(380.)).child(
+                        Input::new(&view_state.jump_host_search)
+                            .prefix(Icon::new(IconName::Search).small()),
+                    ),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "显示 {filtered_len} 项 · 已选择 {} 项",
+                                    view_state.selected_jump_hosts.len()
+                                )),
+                        )
+                        .child(
+                            Button::new("batch-delete-jump-hosts")
+                                .small()
+                                .danger()
+                                .label("批量删除")
+                                .disabled(!has_selection)
+                                .on_click(move |_, window, cx| {
+                                    delete_selected_view.update(cx, |this, cx| {
+                                        this.request_delete_selected_jump_hosts(window, cx)
+                                    });
+                                }),
+                        ),
+                ),
+        )
         .child(
             div().flex_1().min_h_0().overflow_hidden().child(
                 DataTable::new(&view_state.jump_host_table)
