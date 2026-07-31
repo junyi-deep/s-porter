@@ -52,4 +52,11 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> impl In
                 menu_item("时间工具", IconName::Calendar, Page::Time),
             ])),
         )
+        .child(
+            SidebarGroup::new("应用").child(SidebarMenu::new().child(menu_item(
+                "应用更新",
+                IconName::ArrowDown,
+                Page::Update,
+            ))),
+        )
 }

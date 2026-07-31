@@ -259,7 +259,7 @@ pub fn enable_forwarding(jump_host: &JumpHost) -> Result<String> {
     forwarding_result(output)
 }
 
-pub(super) fn connect(jump_host: &JumpHost) -> Result<Session> {
+pub(crate) fn connect(jump_host: &JumpHost) -> Result<Session> {
     let address = format!("{}:{}", jump_host.host.trim(), jump_host.port);
     let tcp = if let Some(proxy) = &jump_host.http_proxy {
         connect_via_http_proxy(jump_host, proxy)

@@ -8,6 +8,7 @@ mod sidebar;
 mod ssh_page;
 mod time_page;
 mod tool_page;
+mod update_page;
 
 use std::borrow::Cow;
 
@@ -35,7 +36,7 @@ impl AssetSource for AppAssets {
     }
 }
 
-pub fn run() {
+pub fn run(distribution: crate::Distribution) {
     let app = gpui_platform::application()
         .with_assets(AppAssets)
         .with_quit_mode(QuitMode::LastWindowClosed);
@@ -49,7 +50,7 @@ pub fn run() {
         };
         cx.spawn(async move |cx| {
             cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|cx| AppView::new(window, cx));
+                let view = cx.new(|cx| AppView::new(distribution, window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("无法打开 S Porter 主窗口");

@@ -21,35 +21,39 @@ jobs:
       - uses: actions/checkout@v4
       - name: Select stable Rust
         run: rustup update stable && rustup default stable
-      - name: Build release binary
+      - name: Build yellow and green release binaries
         run: cargo build --release --locked
-      - name: Create app bundle
+      - name: Create yellow and green app bundles
         shell: bash
         run: |
-          APP="dist/S Porter.app"
-          mkdir -p "$APP/Contents/MacOS"
-          cp target/release/s-porter "$APP/Contents/MacOS/s-porter"
-          chmod +x "$APP/Contents/MacOS/s-porter"
-          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          for REGION in yellow green; do
+            DISPLAY_REGION=$(printf '%s' "$REGION" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+            APP="dist/S Porter $DISPLAY_REGION.app"
+            mkdir -p "$APP/Contents/MacOS"
+            cp "target/release/s-porter-$REGION" "$APP/Contents/MacOS/s-porter"
+            chmod +x "$APP/Contents/MacOS/s-porter"
+            cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>CFBundleDisplayName</key><string>S Porter</string>
+            <key>CFBundleDisplayName</key><string>S Porter $DISPLAY_REGION</string>
             <key>CFBundleExecutable</key><string>s-porter</string>
-            <key>CFBundleIdentifier</key><string>dev.sporter.desktop</string>
-            <key>CFBundleName</key><string>S Porter</string>
+            <key>CFBundleIdentifier</key><string>dev.sporter.desktop.$REGION</string>
+            <key>CFBundleName</key><string>S Porter $DISPLAY_REGION</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict></plist>
           PLIST
-          codesign --force --deep --sign - "$APP"
-          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/s-porter-macos.zip
+            codesign --force --deep --sign - "$APP"
+            ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/s-porter-$REGION-macos.zip"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: s-porter-macos
-          path: dist/s-porter-macos.zip
+          path: dist/s-porter-*-macos.zip
           if-no-files-found: error
 
   windows:
@@ -60,17 +64,18 @@ jobs:
       - name: Select stable Rust
         shell: pwsh
         run: rustup update stable; rustup default stable
-      - name: Build release binary
+      - name: Build yellow and green release binaries
         run: cargo build --release --locked
-      - name: Create ZIP package
+      - name: Create yellow and green ZIP packages
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target/release/s-porter.exe -DestinationPath dist/s-porter-windows.zip
+          Compress-Archive -Path target/release/s-porter-yellow.exe -DestinationPath dist/s-porter-yellow-windows.zip
+          Compress-Archive -Path target/release/s-porter-green.exe -DestinationPath dist/s-porter-green-windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: s-porter-windows
-          path: dist/s-porter-windows.zip
+          path: dist/s-porter-*-windows.zip
           if-no-files-found: error
 
   release:

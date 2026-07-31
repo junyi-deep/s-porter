@@ -1,10 +1,10 @@
 use super::{
     format_page, forward_page, jump_host_page, message_center, sidebar, ssh_page, time_page,
-    tool_page,
+    tool_page, update_page,
 };
 use crate::{
     forward::{self, ForwardConfig, HttpProxyConfig, JumpHost},
-    storage, toolkit,
+    storage, toolkit, updater,
 };
 use chrono::Local;
 use gpui::*;
@@ -45,6 +45,18 @@ pub(super) enum Page {
     Codec,
     Format,
     Time,
+    Update,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum UpdatePhase {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available,
+    Downloading,
+    Failed,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -271,6 +283,8 @@ pub(super) struct AppMessage {
     pub(super) created_at: String,
     pub(super) text: String,
 }
+
+struct UpdateAvailableNotification;
 
 fn remember_command(history: &mut Vec<String>, command: &str) {
     history.retain(|existing| existing != command);
@@ -571,12 +585,22 @@ pub(super) struct AppView {
     pub(super) startup_logs: HashMap<String, Vec<String>>,
     pub(super) selected: HashSet<String>,
     pub(super) selected_jump_hosts: HashSet<String>,
+    pub(super) distribution: crate::Distribution,
+    pub(super) update_info: Option<updater::UpdateInfo>,
+    pub(super) update_progress: updater::UpdateProgress,
+    pub(super) update_phase: UpdatePhase,
+    pub(super) update_status: String,
+    last_notified_update_version: Option<String>,
     busy: bool,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AppView {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        distribution: crate::Distribution,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Theme::global_mut(cx).font_size = px(DEFAULT_UI_FONT_SIZE);
         window.set_rem_size(px(DEFAULT_UI_FONT_SIZE));
         let forward_search = cx
@@ -687,6 +711,12 @@ impl AppView {
             startup_logs: HashMap::new(),
             selected: HashSet::new(),
             selected_jump_hosts: HashSet::new(),
+            distribution,
+            update_info: None,
+            update_progress: updater::UpdateProgress::default(),
+            update_phase: UpdatePhase::Idle,
+            update_status: "尚未检查更新".into(),
+            last_notified_update_version: None,
             busy: false,
             _subscriptions: subscriptions,
         };
@@ -718,6 +748,23 @@ impl AppView {
             }
         })
         .detach();
+        cx.spawn_in(window, async move |weak, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            loop {
+                if weak
+                    .update_in(cx, |this, window, cx| {
+                        this.start_update_check(true, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(60 * 60))
+                    .await;
+            }
+        })
+        .detach();
         view
     }
 
@@ -743,6 +790,45 @@ impl AppView {
                     .selectable(true)
                     .into_any_element()
             }),
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn push_update_notification(
+        &mut self,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = uuid::Uuid::new_v4().to_string();
+        if self.messages.len() >= 100 {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(AppMessage {
+            id,
+            created_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            text: message.clone(),
+        });
+        let view = cx.entity();
+        window.push_notification(
+            Notification::new()
+                .id::<UpdateAvailableNotification>()
+                .title("发现新版本")
+                .message(message)
+                .action(move |_, _, _| {
+                    let view = view.clone();
+                    Button::new("open-application-update")
+                        .primary()
+                        .label("前往更新")
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |this, cx| {
+                                this.page = Page::Update;
+                                cx.notify();
+                            });
+                            window.remove_notification::<UpdateAvailableNotification>(cx);
+                        })
+                }),
             cx,
         );
         cx.notify();
@@ -825,6 +911,133 @@ impl AppView {
             command_history: self.command_history.clone(),
             terminal_history_lines: self.terminal_history_lines,
         }
+    }
+
+    pub(super) fn check_for_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_update_check(false, window, cx);
+    }
+
+    fn start_update_check(&mut self, automatic: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading
+        ) {
+            return;
+        }
+        let config = updater::configured_server(self.distribution);
+        let distribution = self.distribution;
+        self.update_phase = UpdatePhase::Checking;
+        self.update_status = "正在连接更新服务器并检查版本…".into();
+        self.update_info = None;
+        cx.notify();
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { updater::check(&config, distribution) })
+                .await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                let mut update_prompt = None;
+                match result {
+                    Ok(info) => {
+                        let available = info.update_available();
+                        this.update_status = if available {
+                            format!("发现新版本 {}", info.latest_version)
+                        } else {
+                            format!("当前已是最新版本 {}", info.current_version)
+                        };
+                        this.update_phase = if available {
+                            UpdatePhase::Available
+                        } else {
+                            UpdatePhase::UpToDate
+                        };
+                        if automatic
+                            && available
+                            && this.last_notified_update_version.as_deref()
+                                != Some(info.latest_version.as_str())
+                        {
+                            this.last_notified_update_version = Some(info.latest_version.clone());
+                            update_prompt = Some(format!(
+                                "发现新版本 {}，可以立即下载并安装",
+                                info.latest_version
+                            ));
+                        }
+                        this.update_info = Some(info);
+                    }
+                    Err(error) => {
+                        this.update_phase = UpdatePhase::Failed;
+                        this.update_status = format!("检查更新失败：{error:#}");
+                    }
+                }
+                if let Some(message) = update_prompt {
+                    this.push_update_notification(message, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn download_and_install_update(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.update_phase != UpdatePhase::Available {
+            return;
+        }
+        let Some(info) = self.update_info.clone() else {
+            return;
+        };
+        let config = updater::configured_server(self.distribution);
+        let progress = updater::UpdateProgress::default();
+        self.update_progress = progress.clone();
+        self.update_phase = UpdatePhase::Downloading;
+        self.update_status = format!("正在下载版本 {}…", info.latest_version);
+        cx.notify();
+
+        cx.spawn_in(window, async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let keep_polling = weak
+                    .update_in(cx, |this, _, cx| {
+                        if this.update_phase == UpdatePhase::Downloading {
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_polling {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let downloaded = updater::download(&config, &info, &progress)?;
+                    updater::install_and_restart(&downloaded)?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    let _ = weak.update_in(cx, |this, _, cx| {
+                        this.update_phase = UpdatePhase::Failed;
+                        this.update_status = format!("自动更新失败：{error:#}");
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     fn persist(&self) -> anyhow::Result<()> {
@@ -3164,6 +3377,7 @@ impl Render for AppView {
             Page::Codec => tool_page::render(self, false, cx),
             Page::Format => format_page::render(self, cx),
             Page::Time => time_page::render(self, cx),
+            Page::Update => update_page::render(self, cx),
         };
         let main_content = div().size_full().min_w_0().child(page_content);
         let main_layout = if let Some(sidebar_content) = sidebar_content {
