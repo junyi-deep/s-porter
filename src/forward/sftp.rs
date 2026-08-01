@@ -11,7 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const TRANSFER_BUFFER_SIZE: usize = 256 * 1024;
+// A larger buffer lets libssh2 keep enough SFTP requests in flight to fill
+// high-bandwidth, high-latency links. Downloads use 4x read-ahead internally,
+// capped at 8 MiB by libssh2, while uploads can queue the whole supplied slice.
+const UPLOAD_TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const DOWNLOAD_TRANSFER_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 const PROGRESS_UPDATE_BYTES: u64 = 1024 * 1024;
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -343,7 +347,13 @@ pub fn upload(
         let mut remote = sftp
             .create(Path::new(&entry.remote_path))
             .with_context(|| format!("创建远程文件失败：{}", entry.remote_path))?;
-        if let Err(error) = copy_with_progress(&mut local, &mut remote, progress, file_index) {
+        if let Err(error) = copy_with_progress(
+            &mut local,
+            &mut remote,
+            progress,
+            file_index,
+            UPLOAD_TRANSFER_BUFFER_SIZE,
+        ) {
             drop(remote);
             let _ = sftp.unlink(Path::new(&entry.remote_path));
             return Err(error)
@@ -394,7 +404,13 @@ pub fn download(
             .with_context(|| format!("打开远程文件失败：{}", entry.remote_path))?;
         let mut local = fs::File::create(&entry.local_path)
             .with_context(|| format!("创建本地文件失败：{}", entry.local_path.display()))?;
-        if let Err(error) = copy_with_progress(&mut remote, &mut local, progress, file_index) {
+        if let Err(error) = copy_with_progress(
+            &mut remote,
+            &mut local,
+            progress,
+            file_index,
+            DOWNLOAD_TRANSFER_BUFFER_SIZE,
+        ) {
             drop(local);
             let _ = fs::remove_file(&entry.local_path);
             return Err(error).with_context(|| format!("下载文件失败：{}", entry.remote_path));
@@ -541,8 +557,10 @@ fn copy_with_progress(
     writer: &mut impl Write,
     progress: &TransferProgress,
     file_index: usize,
+    buffer_size: usize,
 ) -> Result<()> {
-    let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
+    debug_assert!(buffer_size > 0);
+    let mut buffer = vec![0_u8; buffer_size.max(1)];
     let mut pending_progress = 0_u64;
     let mut last_progress_update = Instant::now();
     loop {
@@ -578,6 +596,7 @@ fn copy_with_progress(
 mod tests {
     use super::*;
     use crate::forward::HttpProxyConfig;
+    use ssh2::MethodType;
     use std::io::Cursor;
 
     const INTEGRATION_TRANSFER_SIZE: usize = 8 * 1024 * 1024;
@@ -642,7 +661,7 @@ mod tests {
             },
         ]);
         let mut output = Vec::new();
-        copy_with_progress(&mut Cursor::new(b"abc"), &mut output, &progress, 0).unwrap();
+        copy_with_progress(&mut Cursor::new(b"abc"), &mut output, &progress, 0, 32).unwrap();
         progress.complete_file(0);
 
         let snapshot = progress.snapshot();
@@ -660,7 +679,7 @@ mod tests {
             local_path: "large".into(),
             remote_path: "/large".into(),
             display_path: "large".into(),
-            size: (TRANSFER_BUFFER_SIZE * 2) as u64,
+            size: (UPLOAD_TRANSFER_BUFFER_SIZE * 2) as u64,
             is_dir: false,
         }]);
         let mut output = CancellingWriter {
@@ -668,18 +687,19 @@ mod tests {
             progress: progress.clone(),
         };
         let error = copy_with_progress(
-            &mut Cursor::new(vec![1; TRANSFER_BUFFER_SIZE * 2]),
+            &mut Cursor::new(vec![1; UPLOAD_TRANSFER_BUFFER_SIZE * 2]),
             &mut output,
             &progress,
             0,
+            UPLOAD_TRANSFER_BUFFER_SIZE,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("已取消"));
-        assert_eq!(output.bytes.len(), TRANSFER_BUFFER_SIZE);
+        assert_eq!(output.bytes.len(), UPLOAD_TRANSFER_BUFFER_SIZE);
         assert_eq!(
             progress.snapshot().transferred_bytes,
-            TRANSFER_BUFFER_SIZE as u64
+            UPLOAD_TRANSFER_BUFFER_SIZE as u64
         );
     }
 
@@ -713,6 +733,17 @@ mod tests {
                 password: "proxypass".into(),
             }),
         };
+
+        let session = connect(&host).unwrap();
+        assert_eq!(
+            session.methods(MethodType::CryptCs),
+            Some("aes128-gcm@openssh.com")
+        );
+        assert_eq!(
+            session.methods(MethodType::CryptSc),
+            Some("aes128-gcm@openssh.com")
+        );
+        drop(session);
 
         let upload_progress = TransferProgress::default();
         assert_eq!(

@@ -43,6 +43,7 @@ serde_json = "1"
 semver = "1"
 sha2 = "0.10"
 self-replace = "1.5"
+socket2 = "0.6"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 urlencoding = "2"
 unicode-width = "0.2"

@@ -1,7 +1,8 @@
 use super::{ForwardConfig, JumpHost};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ssh2::{ErrorCode, PtyModeOpcode, PtyModes, Session};
+use socket2::SockRef;
+use ssh2::{ErrorCode, MethodType, PtyModeOpcode, PtyModes, Session};
 use std::{
     collections::VecDeque,
     io::{ErrorKind, Read, Write},
@@ -16,6 +17,14 @@ use std::{
 
 const MAX_LOG_LINES: usize = 500;
 const SSH_ERROR_EAGAIN: i32 = -37;
+const TCP_TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const SSH_CIPHER_PREFERENCES: &str = concat!(
+    "aes128-gcm@openssh.com,aes256-gcm@openssh.com,",
+    "chacha20-poly1305@openssh.com,",
+    "aes128-ctr,aes256-ctr,aes192-ctr,",
+    "aes256-cbc,rijndael-cbc@lysator.liu.se,aes192-cbc,aes128-cbc,",
+    "blowfish-cbc,arcfour128,arcfour,cast128-cbc,3des-cbc"
+);
 const ROOT_OK_MARKER: &str = "__S_PORTER_ROOT_OK__";
 const ROOT_FAILED_MARKER: &str = "__S_PORTER_ROOT_FAILED__";
 const FORWARDING_OK_MARKER: &str = "__S_PORTER_FORWARDING_OK__";
@@ -267,9 +276,16 @@ pub(crate) fn connect(jump_host: &JumpHost) -> Result<Session> {
     } else {
         connect_address(&address).with_context(|| format!("无法连接 SSH 服务 {address}"))?
     };
+    optimize_tcp_stream(&tcp)?;
     tcp.set_read_timeout(Some(Duration::from_secs(35)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(15)))?;
     let mut session = Session::new().context("初始化 SSH 会话失败")?;
+    session
+        .method_pref(MethodType::CryptCs, SSH_CIPHER_PREFERENCES)
+        .context("设置 SSH 上传加密算法优先级失败")?;
+    session
+        .method_pref(MethodType::CryptSc, SSH_CIPHER_PREFERENCES)
+        .context("设置 SSH 下载加密算法优先级失败")?;
     session.set_tcp_stream(tcp);
     session.handshake().context("SSH 握手失败")?;
     session
@@ -279,6 +295,18 @@ pub(crate) fn connect(jump_host: &JumpHost) -> Result<Session> {
         bail!("SSH 认证未通过");
     }
     Ok(session)
+}
+
+fn optimize_tcp_stream(tcp: &TcpStream) -> Result<()> {
+    tcp.set_nodelay(true).context("启用 TCP_NODELAY 失败")?;
+
+    // Modern operating systems may clamp these values or keep their own
+    // auto-tuned values. Buffer tuning is therefore best-effort and must not
+    // turn an otherwise valid SSH connection into a failure.
+    let socket = SockRef::from(tcp);
+    let _ = socket.set_send_buffer_size(TCP_TRANSFER_BUFFER_SIZE);
+    let _ = socket.set_recv_buffer_size(TCP_TRANSFER_BUFFER_SIZE);
+    Ok(())
 }
 
 fn connect_address(address: &str) -> Result<TcpStream> {
@@ -477,6 +505,30 @@ fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, message: String) {
 mod tests {
     use super::*;
     use crate::forward::HttpProxyConfig;
+
+    #[test]
+    fn optimized_tcp_stream_enables_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = thread::spawn(move || listener.accept().unwrap());
+        let tcp = TcpStream::connect(address).unwrap();
+
+        optimize_tcp_stream(&tcp).unwrap();
+
+        assert!(tcp.nodelay().unwrap());
+        drop(tcp);
+        drop(accept.join().unwrap());
+    }
+
+    #[test]
+    fn cipher_preferences_prioritize_aes_gcm_and_keep_fallbacks() {
+        assert!(
+            SSH_CIPHER_PREFERENCES.starts_with("aes128-gcm@openssh.com,aes256-gcm@openssh.com")
+        );
+        assert!(SSH_CIPHER_PREFERENCES.contains("chacha20-poly1305@openssh.com"));
+        assert!(SSH_CIPHER_PREFERENCES.contains("aes128-ctr"));
+        assert!(SSH_CIPHER_PREFERENCES.contains("aes128-cbc"));
+    }
 
     #[test]
     fn tunnel_logs_include_local_time() {
