@@ -1,4 +1,7 @@
+//! 紧凑的服务器搜索选择器。
+
 use crate::forward::JumpHost;
+use crate::ui::search::RegexSearch;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -7,7 +10,7 @@ use gpui_component::{
     *,
 };
 
-pub(super) fn render<F>(
+pub(in crate::ui) fn render<F>(
     id_prefix: &'static str,
     hosts: &[JumpHost],
     search_input: &Entity<InputState>,
@@ -18,15 +21,16 @@ pub(super) fn render<F>(
 where
     F: Fn(String, &mut Window, &mut App) + Clone + 'static,
 {
-    let search = search_input.read(cx).value().trim().to_lowercase();
+    let search = RegexSearch::new(search_input.read(cx).value().as_ref());
+    let search_error = search.error().map(ToOwned::to_owned);
     let filtered = hosts
         .iter()
         .filter(|host| {
-            search.is_empty()
-                || host.name.to_lowercase().contains(&search)
-                || host.host.to_lowercase().contains(&search)
-                || host.username.to_lowercase().contains(&search)
-                || host.port.to_string().contains(&search)
+            search.matches_any([
+                host.name.as_str(),
+                host.host.as_str(),
+                host.username.as_str(),
+            ]) || search.matches(&host.port.to_string())
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -35,9 +39,16 @@ where
     v_flex()
         .gap_2()
         .child(
-            Input::new(search_input)
-                .prefix(Icon::new(IconName::Search).small())
-                .cleanable(true),
+            v_flex()
+                .gap_1()
+                .child(
+                    Input::new(search_input)
+                        .prefix(Icon::new(IconName::Search).small())
+                        .cleanable(true),
+                )
+                .when_some(search_error, |field, error| {
+                    field.child(div().text_xs().text_color(cx.theme().danger).child(error))
+                }),
         )
         .child(
             v_flex()

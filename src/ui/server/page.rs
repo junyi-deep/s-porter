@@ -1,4 +1,4 @@
-use super::app::AppView;
+use crate::ui::app::AppView;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -21,7 +21,7 @@ struct JumpHostTableRow {
     selected: bool,
 }
 
-pub(super) struct JumpHostTableDelegate {
+pub(in crate::ui) struct JumpHostTableDelegate {
     view: WeakEntity<AppView>,
     columns: Vec<Column>,
     rows: Vec<JumpHostTableRow>,
@@ -31,7 +31,7 @@ pub(super) struct JumpHostTableDelegate {
 }
 
 impl JumpHostTableDelegate {
-    pub(super) fn new(view: Entity<AppView>) -> Self {
+    pub(in crate::ui) fn new(view: Entity<AppView>) -> Self {
         Self {
             view: view.downgrade(),
             columns: vec![
@@ -274,54 +274,54 @@ impl TableDelegate for JumpHostTableDelegate {
 
 fn form_inputs(view: &AppView) -> Vec<FormInput> {
     vec![
-        ("服务器名称", view.jump_host_form.name.clone(), false, true),
+        ("服务器名称", view.servers.form.name.clone(), false, true),
         (
             "SSH 地址 / 域名",
-            view.jump_host_form.host.clone(),
+            view.servers.form.host.clone(),
             false,
             true,
         ),
-        ("SSH 端口", view.jump_host_form.port.clone(), false, true),
+        ("SSH 端口", view.servers.form.port.clone(), false, true),
         (
             "登录用户名",
-            view.jump_host_form.username.clone(),
+            view.servers.form.username.clone(),
             false,
             true,
         ),
-        ("登录密码", view.jump_host_form.password.clone(), true, true),
+        ("登录密码", view.servers.form.password.clone(), true, true),
         (
             "root 用户名",
-            view.jump_host_form.root_username.clone(),
+            view.servers.form.root_username.clone(),
             false,
             true,
         ),
         (
             "root 密码",
-            view.jump_host_form.root_password.clone(),
+            view.servers.form.root_password.clone(),
             true,
             true,
         ),
         (
             "HTTP 代理地址（可选）",
-            view.jump_host_form.proxy_host.clone(),
+            view.servers.form.proxy_host.clone(),
             false,
             false,
         ),
         (
             "HTTP 代理端口",
-            view.jump_host_form.proxy_port.clone(),
+            view.servers.form.proxy_port.clone(),
             false,
             false,
         ),
         (
             "代理用户名（可选）",
-            view.jump_host_form.proxy_username.clone(),
+            view.servers.form.proxy_username.clone(),
             false,
             false,
         ),
         (
             "代理密码（可选）",
-            view.jump_host_form.proxy_password.clone(),
+            view.servers.form.proxy_password.clone(),
             true,
             false,
         ),
@@ -341,17 +341,17 @@ fn configure_dialog(
         .width(px(820.))
         .on_ok(move |_, window, cx| {
             keyboard_save_view.update(cx, |this, cx| {
-                this.jump_host_batch_mode = is_batch;
+                this.servers.batch_mode = is_batch;
                 this.save_jump_host(window, cx)
             })
         })
         .p_0()
         .content(move |content, _, cx| {
             let view_state = view.read(cx);
-            let is_editing = view_state.editing_jump_host_id.is_some();
-            let batch_entries = view_state.jump_host_form.batch_entries.clone();
-            let batch_separator = view_state.jump_host_form.batch_separator.clone();
-            let form_error = view_state.jump_host_form_error.clone();
+            let is_editing = view_state.servers.editing_id.is_some();
+            let batch_entries = view_state.servers.form.batch_entries.clone();
+            let batch_separator = view_state.servers.form.batch_separator.clone();
+            let form_error = view_state.servers.form_error.clone();
             let test_view = test_view.clone();
             let save_view = button_save_view.clone();
             content
@@ -500,7 +500,7 @@ fn configure_dialog(
                                         .label("保存")
                                         .on_click(move |_, window, cx| {
                                             if save_view.update(cx, |this, cx| {
-                                                this.jump_host_batch_mode = is_batch;
+                                                this.servers.batch_mode = is_batch;
                                                 this.save_jump_host(window, cx)
                                             }) {
                                                 window.close_dialog(cx);
@@ -568,24 +568,23 @@ fn open_copy_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
     });
 }
 
-pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub(in crate::ui) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
     let view = cx.entity();
     let dialog = add_dialog(view_state, cx).into_any_element();
-    let search = view_state
-        .jump_host_search
-        .read(cx)
-        .value()
-        .trim()
-        .to_lowercase();
+    let search =
+        crate::ui::search::RegexSearch::new(view_state.servers.search.read(cx).value().as_ref());
+    let search_error = search.error().map(ToOwned::to_owned);
     let filtered = view_state
+        .servers
         .jump_hosts
         .iter()
         .filter(|host| {
-            search.is_empty()
-                || host.name.to_lowercase().contains(&search)
-                || host.host.to_lowercase().contains(&search)
-                || host.username.to_lowercase().contains(&search)
-                || host.root_username.to_lowercase().contains(&search)
+            search.matches_any([
+                host.name.as_str(),
+                host.host.as_str(),
+                host.username.as_str(),
+                host.root_username.as_str(),
+            ])
         })
         .collect::<Vec<_>>();
     let visible_ids = filtered
@@ -595,33 +594,35 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
     let all_selected = !visible_ids.is_empty()
         && visible_ids
             .iter()
-            .all(|id| view_state.selected_jump_hosts.contains(id));
+            .all(|id| view_state.servers.selected.contains(id));
     let filtered_len = filtered.len();
-    let has_selection = !view_state.selected_jump_hosts.is_empty();
+    let has_selection = !view_state.servers.selected.is_empty();
     let delete_selected_view = view.clone();
     let rows = filtered
         .into_iter()
         .map(|host| JumpHostTableRow {
             host: host.clone(),
             forward_count: view_state
-                .forwards
+                .forwarding
+                .configs
                 .iter()
                 .filter(|item| item.jump_host_id == host.id)
                 .count(),
             connection_count: view_state
-                .ssh_tabs
+                .ssh
+                .tabs
                 .iter()
                 .filter(|tab| tab.jump_host_id == host.id)
                 .count(),
-            selected: view_state.selected_jump_hosts.contains(&host.id),
+            selected: view_state.servers.selected.contains(&host.id),
         })
         .collect();
-    let empty_message = if view_state.jump_hosts.is_empty() {
+    let empty_message = if view_state.servers.jump_hosts.is_empty() {
         "暂无服务器，点击右上角新增"
     } else {
         "没有符合搜索条件的服务器"
     };
-    view_state.jump_host_table.update(cx, |table, cx| {
+    view_state.servers.table.update(cx, |table, cx| {
         table
             .delegate_mut()
             .update_rows(rows, visible_ids, all_selected, empty_message.into());
@@ -653,10 +654,16 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                 .justify_between()
                 .gap_3()
                 .child(
-                    div().w(px(380.)).child(
-                        Input::new(&view_state.jump_host_search)
-                            .prefix(Icon::new(IconName::Search).small()),
-                    ),
+                    v_flex()
+                        .w(px(380.))
+                        .gap_1()
+                        .child(
+                            Input::new(&view_state.servers.search)
+                                .prefix(Icon::new(IconName::Search).small()),
+                        )
+                        .when_some(search_error, |field, error| {
+                            field.child(div().text_xs().text_color(cx.theme().danger).child(error))
+                        }),
                 )
                 .child(
                     h_flex()
@@ -667,7 +674,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                                 .text_color(cx.theme().muted_foreground)
                                 .child(format!(
                                     "显示 {filtered_len} 项 · 已选择 {} 项",
-                                    view_state.selected_jump_hosts.len()
+                                    view_state.servers.selected.len()
                                 )),
                         )
                         .child(
@@ -686,7 +693,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
         )
         .child(
             div().flex_1().min_h_0().overflow_hidden().child(
-                DataTable::new(&view_state.jump_host_table)
+                DataTable::new(&view_state.servers.table)
                     .bordered(true)
                     .scrollbar_visible(true, true),
             ),

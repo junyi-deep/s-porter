@@ -1,8 +1,12 @@
-use super::app::{
-    AppView, RemoteSortField, SshConnectionState, SshFilePanelView, SshTab, TerminalSelection,
-    TransferDirection, TransferStatus, UI_FONT_SIZES,
+use super::{
+    SendBackTab, SendTab,
+    state::{
+        RemoteSortField, SshConnectionState, SshFilePanelView, SshTab, TerminalSelection,
+        TransferDirection, TransferStatus,
+    },
 };
 use crate::forward::TransferStage;
+use crate::ui::app::{AppView, UI_FONT_SIZES};
 use gpui::InteractiveElement as _;
 use gpui::StatefulInteractiveElement as _;
 use gpui::prelude::FluentBuilder as _;
@@ -18,6 +22,8 @@ use gpui_component::{
     tooltip::Tooltip,
     *,
 };
+
+const DEFAULT_SSH_TERMINAL_FONT_SIZE: f32 = 12.;
 use std::{cell::Cell, path::PathBuf, rc::Rc};
 use unicode_width::UnicodeWidthChar as _;
 
@@ -144,7 +150,7 @@ fn open_connection_dialog(
                 let search = search.clone();
                 move |content, _, cx| {
                     let connect_view = view.clone();
-                    content.child(super::jump_host_picker::render(
+                    content.child(crate::ui::server::picker::render(
                         "ssh-host-picker",
                         &hosts,
                         &search,
@@ -170,8 +176,8 @@ fn render_tabs(
     view: &Entity<AppView>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let active_id = view_state.active_ssh_tab_id.clone();
-    let tabs = view_state.ssh_tabs.iter().map(|tab| {
+    let active_id = view_state.ssh.active_tab_id.clone();
+    let tabs = view_state.ssh.tabs.iter().map(|tab| {
         let activate_view = view.clone();
         let close_view = view.clone();
         let close_menu_view = view.clone();
@@ -455,7 +461,6 @@ fn set_terminal_scroll_from_thumb(
 fn render_terminal(
     tab: &SshTab,
     quick_commands: &[crate::storage::QuickCommand],
-    global_font_size: f32,
     terminal_history_lines: usize,
     view: &Entity<AppView>,
     cx: &mut Context<AppView>,
@@ -484,6 +489,10 @@ fn render_terminal(
     let search_next_id = tab.id.clone();
     let terminal_input_view = view.clone();
     let terminal_input_id = tab.id.clone();
+    let terminal_tab_view = view.clone();
+    let terminal_tab_id = tab.id.clone();
+    let terminal_backtab_view = view.clone();
+    let terminal_backtab_id = tab.id.clone();
     let terminal_select_view = view.clone();
     let terminal_select_id = tab.id.clone();
     let terminal_finish_view = view.clone();
@@ -502,11 +511,11 @@ fn render_terminal(
     let font_size_tab_id = tab.id.clone();
     let history_lines_view = view.clone();
     let custom_font_size = tab.terminal_font_size;
-    let terminal_font_size = custom_font_size.unwrap_or(global_font_size);
+    let terminal_font_size = custom_font_size.unwrap_or(DEFAULT_SSH_TERMINAL_FONT_SIZE);
     let terminal_selection = tab.terminal_selection;
     let terminal_scroll_for_selection = tab.terminal_scroll.clone();
     let terminal_search_query = tab.terminal_search.read(cx).value().to_string();
-    let terminal_search_matches = std::sync::Arc::new(super::app::terminal_search_matches(
+    let terminal_search_matches = std::sync::Arc::new(super::terminal::terminal_search_matches(
         &tab.terminal_lines,
         &terminal_search_query,
     ));
@@ -667,24 +676,22 @@ fn render_terminal(
                                 .tooltip(if custom_font_size.is_some() {
                                     "SSH 输出内容使用独立字号"
                                 } else {
-                                    "SSH 输出内容跟随全局字号"
+                                    "SSH 输出内容使用默认字号 12px"
                                 })
                                 .dropdown_menu(move |menu, _, _| {
                                     let follow_view = font_size_view.clone();
                                     let follow_id = font_size_tab_id.clone();
                                     UI_FONT_SIZES.into_iter().fold(
                                         menu.item(
-                                            PopupMenuItem::new(format!(
-                                                "跟随全局（{global_font_size:.0}px）"
-                                            ))
-                                            .checked(custom_font_size.is_none())
-                                            .on_click(move |_, _, cx| {
-                                                follow_view.update(cx, |this, cx| {
-                                                    this.set_ssh_terminal_font_size(
-                                                        &follow_id, None, cx,
-                                                    )
-                                                });
-                                            }),
+                                            PopupMenuItem::new("默认（12px）")
+                                                .checked(custom_font_size.is_none())
+                                                .on_click(move |_, _, cx| {
+                                                    follow_view.update(cx, |this, cx| {
+                                                        this.set_ssh_terminal_font_size(
+                                                            &follow_id, None, cx,
+                                                        )
+                                                    });
+                                                }),
                                         )
                                         .separator(),
                                         |menu, font_size| {
@@ -828,10 +835,23 @@ fn render_terminal(
                 .focusable()
                 .track_focus(&tab.terminal_focus)
                 .key_context("SshTerminal")
+                .on_action(move |_: &SendTab, _, cx| {
+                    // Action 会早于 key_down 分发；必须在这里阻止 Root 的焦点导航。
+                    cx.stop_propagation();
+                    terminal_tab_view.update(cx, |this, cx| {
+                        this.send_ssh_terminal_tab(&terminal_tab_id, false, cx)
+                    });
+                })
+                .on_action(move |_: &SendBackTab, _, cx| {
+                    cx.stop_propagation();
+                    terminal_backtab_view.update(cx, |this, cx| {
+                        this.send_ssh_terminal_tab(&terminal_backtab_id, true, cx)
+                    });
+                })
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     terminal_focus.focus(window, cx);
                 })
-                .on_key_down(move |event, window, cx| {
+                .capture_key_down(move |event, window, cx| {
                     let handled = terminal_input_view.update(cx, |this, cx| {
                         this.send_ssh_keystroke(&terminal_input_id, event, window, cx)
                     });
@@ -1927,15 +1947,16 @@ fn render_file_panel(
         .into_any_element()
 }
 
-pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub(in crate::ui) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
     let view = cx.entity();
     let active_tab = view_state
-        .active_ssh_tab_id
+        .ssh
+        .active_tab_id
         .as_deref()
-        .and_then(|id| view_state.ssh_tabs.iter().find(|tab| tab.id == id));
+        .and_then(|id| view_state.ssh.tabs.iter().find(|tab| tab.id == id));
     let connect_view = view.clone();
-    let hosts = view_state.jump_hosts.clone();
-    let host_search = view_state.ssh_host_picker_search.clone();
+    let hosts = view_state.servers.jump_hosts.clone();
+    let host_search = view_state.ssh.host_picker_search.clone();
     let tabs = render_tabs(view_state, &view, cx);
 
     v_flex()
@@ -1986,8 +2007,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                         resizable_panel().child(div().size_full().min_w_0().min_h_0().child(
                             render_terminal(
                                 tab,
-                                &view_state.quick_commands,
-                                view_state.ui_font_size(),
+                                &view_state.ssh.quick_commands,
                                 view_state.terminal_history_lines(),
                                 &view,
                                 cx,
@@ -2011,8 +2031,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                     .overflow_hidden()
                     .child(div().size_full().min_w_0().min_h_0().child(render_terminal(
                         tab,
-                        &view_state.quick_commands,
-                        view_state.ui_font_size(),
+                        &view_state.ssh.quick_commands,
                         view_state.terminal_history_lines(),
                         &view,
                         cx,
@@ -2026,7 +2045,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                 .items_center()
                 .justify_center()
                 .text_color(cx.theme().muted_foreground)
-                .child(if view_state.jump_hosts.is_empty() {
+                .child(if view_state.servers.jump_hosts.is_empty() {
                     "请先新增服务器"
                 } else {
                     "点击右上角“新增连接”"
@@ -2039,11 +2058,17 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteSortField, set_terminal_scroll_from_thumb, sorted_remote_entries,
-        terminal_display_range, terminal_scrollbar_metrics, terminal_text_with_cursor,
+        DEFAULT_SSH_TERMINAL_FONT_SIZE, RemoteSortField, set_terminal_scroll_from_thumb,
+        sorted_remote_entries, terminal_display_range, terminal_scrollbar_metrics,
+        terminal_text_with_cursor,
     };
     use crate::forward::{RemoteEntry, TerminalLine};
     use gpui::UniformListScrollHandle;
+
+    #[test]
+    fn ssh_terminal_default_font_size_is_twelve_pixels() {
+        assert_eq!(DEFAULT_SSH_TERMINAL_FONT_SIZE, 12.);
+    }
 
     fn entry(name: &str, modified_at: u64) -> RemoteEntry {
         RemoteEntry {

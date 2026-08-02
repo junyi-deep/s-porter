@@ -5615,6 +5615,7 @@ dependencies = [
  "notify-rust",
  "quick-xml",
  "rand_core 0.6.4",
+ "regex",
  "self-replace",
  "semver",
  "serde",

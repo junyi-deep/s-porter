@@ -1,4 +1,4 @@
-use super::app::AppView;
+use crate::ui::app::AppView;
 use crate::{system_notification, toolkit};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -9,14 +9,6 @@ use gpui_component::{
     scroll::ScrollableElement,
     *,
 };
-
-const TIMEZONES: [(&str, &str); 5] = [
-    ("Asia/Shanghai", "上海 UTC+8"),
-    ("UTC", "UTC"),
-    ("Asia/Tokyo", "东京 UTC+9"),
-    ("Europe/London", "伦敦"),
-    ("America/New_York", "纽约"),
-];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TimeTab {
@@ -30,7 +22,7 @@ enum PomodoroPhase {
     Break,
 }
 
-pub(super) struct TimeToolState {
+pub(in crate::ui) struct TimeToolState {
     tab: TimeTab,
     timezone: String,
     custom_timezone_offset: i8,
@@ -56,8 +48,8 @@ pub(super) struct TimeToolState {
 }
 
 impl TimeToolState {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<AppView>) -> Self {
-        let timezone = "Asia/Shanghai";
+    pub(in crate::ui) fn new(window: &mut Window, cx: &mut Context<AppView>) -> Self {
+        let timezone = "UTC+8";
         let now = toolkit::format_now(timezone).unwrap_or_default();
         let (milliseconds, seconds, days) =
             toolkit::timestamp_values(&now, timezone).unwrap_or_default();
@@ -347,7 +339,7 @@ impl AppView {
         cx.notify();
     }
 
-    pub(super) fn tick_time_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::ui) fn tick_time_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
         if self.time_tools.stopwatch_running {
             self.time_tools.stopwatch_seconds = self.time_tools.stopwatch_seconds.saturating_add(1);
@@ -493,90 +485,64 @@ fn render_convert(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement
     let view = cx.entity();
     let reset_view = view.clone();
     let convert_view = view.clone();
-    let timezone = view_state.time_tools.timezone.clone();
     let custom_offset = view_state.time_tools.custom_timezone_offset;
     let datetime = view_state.time_tools.datetime.clone();
-    let timezone_buttons = TIMEZONES.into_iter().map(|(name, label)| {
-        let view = view.clone();
-        Button::new(format!("timezone-{name}"))
-            .small()
-            .when(name == timezone, |button| button.primary())
-            .when(name != timezone, |button| button.outline())
-            .label(label)
-            .on_click(move |_, window, cx| {
-                view.update(cx, |this, cx| this.switch_timezone(name, window, cx));
-            })
-    });
 
     v_flex()
         .gap_5()
         .child(
-            v_flex()
-                .gap_2()
-                .child(div().text_sm().font_medium().child("时区"))
-                .child(h_flex().flex_wrap().gap_2().children(timezone_buttons))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().text_sm().font_medium().child("自定义 UTC 时区"))
-                        .child(
-                            Button::new("custom-timezone-minus")
-                                .outline()
-                                .icon(IconName::Minus)
-                                .tooltip("减少一小时")
-                                .disabled(custom_offset <= -12)
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, _, cx| {
-                                        view.update(cx, |this, cx| {
-                                            this.adjust_custom_timezone(-1, cx)
-                                        });
-                                    }
-                                }),
-                        )
-                        .child(
-                            div()
-                                .w(px(72.))
-                                .text_center()
-                                .font_family("monospace")
-                                .font_semibold()
-                                .child(format!("UTC{custom_offset:+}")),
-                        )
-                        .child(
-                            Button::new("custom-timezone-plus")
-                                .outline()
-                                .icon(IconName::Plus)
-                                .tooltip("增加一小时")
-                                .disabled(custom_offset >= 12)
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, _, cx| {
-                                        view.update(cx, |this, cx| {
-                                            this.adjust_custom_timezone(1, cx)
-                                        });
-                                    }
-                                }),
-                        )
-                        .child(
-                            Button::new("apply-custom-timezone")
-                                .outline()
-                                .label("应用")
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, window, cx| {
-                                        view.update(cx, |this, cx| {
-                                            this.apply_custom_timezone(window, cx)
-                                        });
-                                    }
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(format!("当前：{}", view_state.time_tools.timezone)),
-                        ),
-                ),
+            v_flex().gap_2().child(
+                h_flex()
+                    .gap_2()
+                    .child(div().text_sm().font_medium().child("自定义时区"))
+                    .child(
+                        Button::new("custom-timezone-minus")
+                            .outline()
+                            .icon(IconName::Minus)
+                            .tooltip("减少一小时")
+                            .disabled(custom_offset <= -12)
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.adjust_custom_timezone(-1, cx));
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .text_center()
+                            .font_family("monospace")
+                            .font_semibold()
+                            .child(format!("UTC{custom_offset:+}")),
+                    )
+                    .child(
+                        Button::new("custom-timezone-plus")
+                            .outline()
+                            .icon(IconName::Plus)
+                            .tooltip("增加一小时")
+                            .disabled(custom_offset >= 12)
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |this, cx| this.adjust_custom_timezone(1, cx));
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("apply-custom-timezone")
+                            .outline()
+                            .label("应用")
+                            .on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.apply_custom_timezone(window, cx)
+                                    });
+                                }
+                            }),
+                    ),
+            ),
         )
         .child(
             v_flex()
@@ -817,7 +783,7 @@ fn render_timers(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement 
         .into_any_element()
 }
 
-pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub(in crate::ui) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
     let view = cx.entity();
     let convert_view = view.clone();
     let timers_view = view;

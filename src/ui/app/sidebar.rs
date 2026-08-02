@@ -1,4 +1,4 @@
-use super::app::{AppView, Page};
+use super::{AppView, ui_state::Page};
 use gpui::*;
 use gpui_component::{
     sidebar::{
@@ -13,10 +13,10 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> impl In
         let view = view.clone();
         SidebarMenuItem::new(label)
             .icon(icon)
-            .active(view_state.page == page)
+            .active(view_state.navigation.page == page)
             .on_click(move |_, _, cx| {
                 view.update(cx, |this, cx| {
-                    this.page = page;
+                    this.navigation.page = page;
                     cx.notify();
                 });
             })

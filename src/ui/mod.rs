@@ -1,14 +1,9 @@
 mod app;
-mod format_page;
-mod forward_page;
-mod jump_host_page;
-mod jump_host_picker;
-mod message_center;
-mod sidebar;
-mod ssh_page;
-mod time_page;
-mod tool_page;
-mod update_page;
+mod forwarding;
+mod search;
+mod server;
+mod ssh;
+mod tools;
 
 use std::borrow::Cow;
 
@@ -42,6 +37,7 @@ pub fn run(distribution: crate::Distribution) {
         .with_quit_mode(QuitMode::LastWindowClosed);
     app.run(move |cx| {
         gpui_component::init(cx);
+        ssh::init(cx);
         let window_options = WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
             window_bounds: Some(WindowBounds::centered(size(px(1180.), px(760.)), cx)),

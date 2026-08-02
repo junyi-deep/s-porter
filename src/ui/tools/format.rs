@@ -1,5 +1,5 @@
-use super::app::{AppView, ToolInputs};
 use crate::toolkit;
+use crate::ui::app::message_center::{self, MessageCenter};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -14,32 +14,47 @@ enum FormatTab {
     Xml,
 }
 
-pub(super) struct FormatToolState {
+pub(in crate::ui) struct FormatToolState {
     tab: FormatTab,
-    json: ToolInputs,
-    xml: ToolInputs,
+    json: FormatInputs,
+    xml: FormatInputs,
 }
 
-impl FormatToolState {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<AppView>) -> Self {
+struct FormatInputs {
+    source: Entity<InputState>,
+    result: Entity<InputState>,
+}
+
+impl FormatInputs {
+    fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
-            tab: FormatTab::Json,
-            json: ToolInputs::new(window, cx),
-            xml: ToolInputs::new(window, cx),
+            source: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .placeholder("在此输入待处理内容")
+            }),
+            result: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .placeholder("处理结果")
+            }),
         }
     }
 }
 
-impl AppView {
-    pub(super) fn run_format(
-        &mut self,
-        action: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let inputs = match self.format_tools.tab {
-            FormatTab::Json => &self.format_tools.json,
-            FormatTab::Xml => &self.format_tools.xml,
+impl FormatToolState {
+    pub(in crate::ui) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            tab: FormatTab::Json,
+            json: FormatInputs::new(window, cx),
+            xml: FormatInputs::new(window, cx),
+        }
+    }
+
+    fn run(&self, action: &'static str, window: &mut Window, cx: &mut App) {
+        let inputs = match self.tab {
+            FormatTab::Json => &self.json,
+            FormatTab::Xml => &self.xml,
         };
         let source = inputs.source.read(cx).value().to_string();
         let result = match action {
@@ -63,9 +78,9 @@ fn editor_header(
     label: &'static str,
     id: &'static str,
     state: Entity<InputState>,
-    cx: &mut Context<AppView>,
+    messages: Entity<MessageCenter>,
+    cx: &mut App,
 ) -> impl IntoElement {
-    let view = cx.entity();
     let copy_state = state.clone();
     let clear_state = state;
     h_flex()
@@ -89,9 +104,7 @@ fn editor_header(
                         .on_click(move |_, window, cx| {
                             let text = copy_state.read(cx).value().to_string();
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            view.update(cx, |this, cx| {
-                                this.push_message("已复制到剪贴板", window, cx)
-                            });
+                            message_center::push(&messages, "已复制到剪贴板", window, cx);
                         }),
                 )
                 .child(
@@ -111,21 +124,25 @@ fn action_button(
     id: &'static str,
     label: &'static str,
     primary: bool,
-    cx: &mut Context<AppView>,
+    state: Entity<FormatToolState>,
 ) -> Button {
-    let view = cx.entity();
     Button::new(id)
         .when(primary, |button| button.primary())
         .when(!primary, |button| button.outline())
         .label(label)
-        .on_click(move |_, window, cx| view.update(cx, |this, cx| this.run_format(id, window, cx)))
+        .on_click(move |_, window, cx| state.update(cx, |state, cx| state.run(id, window, cx)))
 }
 
-pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
-    let tab = view_state.format_tools.tab;
+pub(in crate::ui) fn render(
+    state: Entity<FormatToolState>,
+    messages: Entity<MessageCenter>,
+    cx: &mut App,
+) -> AnyElement {
+    let state_ref = state.read(cx);
+    let tab = state_ref.tab;
     let inputs = match tab {
-        FormatTab::Json => &view_state.format_tools.json,
-        FormatTab::Xml => &view_state.format_tools.xml,
+        FormatTab::Json => &state_ref.json,
+        FormatTab::Xml => &state_ref.xml,
     };
     let source_state = inputs.source.clone();
     let result_state = inputs.result.clone();
@@ -135,23 +152,36 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
     };
     let actions = match tab {
         FormatTab::Json => vec![
-            action_button("json-format", "JSON 格式化", true, cx),
-            action_button("json-minify", "JSON 压缩", false, cx),
-            action_button("json-escape", "转义为字符串", false, cx),
-            action_button("json-unescape", "字符串反转义", false, cx),
+            action_button("json-format", "JSON 格式化", true, state.clone()),
+            action_button("json-minify", "JSON 压缩", false, state.clone()),
+            action_button("json-escape", "转义为字符串", false, state.clone()),
+            action_button("json-unescape", "字符串反转义", false, state.clone()),
         ],
         FormatTab::Xml => vec![
-            action_button("xml-format", "XML 格式化", true, cx),
-            action_button("xml-minify", "XML 压缩", false, cx),
+            action_button("xml-format", "XML 格式化", true, state.clone()),
+            action_button("xml-minify", "XML 压缩", false, state.clone()),
         ],
     };
-    let view = cx.entity();
-    let json_view = view.clone();
-    let xml_view = view;
-    let source_header =
-        editor_header(page_key, "输入内容", "source", source_state.clone(), cx).into_any_element();
-    let result_header =
-        editor_header(page_key, "处理结果", "result", result_state.clone(), cx).into_any_element();
+    let json_state = state.clone();
+    let xml_state = state;
+    let source_header = editor_header(
+        page_key,
+        "输入内容",
+        "source",
+        source_state.clone(),
+        messages.clone(),
+        cx,
+    )
+    .into_any_element();
+    let result_header = editor_header(
+        page_key,
+        "处理结果",
+        "result",
+        result_state.clone(),
+        messages,
+        cx,
+    )
+    .into_any_element();
 
     v_flex()
         .size_full()
@@ -177,8 +207,8 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                         .when(tab != FormatTab::Json, |button| button.ghost())
                         .label("JSON")
                         .on_click(move |_, _, cx| {
-                            json_view.update(cx, |this, cx| {
-                                this.format_tools.tab = FormatTab::Json;
+                            json_state.update(cx, |state, cx| {
+                                state.tab = FormatTab::Json;
                                 cx.notify();
                             });
                         }),
@@ -189,8 +219,8 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                         .when(tab != FormatTab::Xml, |button| button.ghost())
                         .label("XML")
                         .on_click(move |_, _, cx| {
-                            xml_view.update(cx, |this, cx| {
-                                this.format_tools.tab = FormatTab::Xml;
+                            xml_state.update(cx, |state, cx| {
+                                state.tab = FormatTab::Xml;
                                 cx.notify();
                             });
                         }),

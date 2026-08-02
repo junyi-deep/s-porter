@@ -1,4 +1,10 @@
-use super::app::{AppView, ForwardState, ForwardStatusFilter};
+use crate::ui::{
+    app::{
+        AppView,
+        ui_state::{ForwardState, ForwardStatusFilter},
+    },
+    server::picker as jump_host_picker,
+};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -22,7 +28,7 @@ struct ForwardTableRow {
     can_edit: bool,
 }
 
-pub(super) struct ForwardTableDelegate {
+pub(in crate::ui) struct ForwardTableDelegate {
     view: WeakEntity<AppView>,
     columns: Vec<Column>,
     rows: Vec<ForwardTableRow>,
@@ -32,7 +38,7 @@ pub(super) struct ForwardTableDelegate {
 }
 
 impl ForwardTableDelegate {
-    pub(super) fn new(view: Entity<AppView>) -> Self {
+    pub(in crate::ui) fn new(view: Entity<AppView>) -> Self {
         Self {
             view: view.downgrade(),
             columns: vec![
@@ -339,10 +345,25 @@ impl TableDelegate for ForwardTableDelegate {
 
 fn form_inputs(view: &AppView) -> Vec<FormInput> {
     vec![
-        ("配置名称", view.form.name.clone(), false, true),
-        ("本地端口", view.form.local_port.clone(), false, true),
-        ("远程 IP / 域名", view.form.remote_ip.clone(), false, true),
-        ("远程端口", view.form.remote_port.clone(), false, true),
+        ("配置名称", view.forwarding.form.name.clone(), false, true),
+        (
+            "本地端口",
+            view.forwarding.form.local_port.clone(),
+            false,
+            true,
+        ),
+        (
+            "远程 IP / 域名",
+            view.forwarding.form.remote_ip.clone(),
+            false,
+            true,
+        ),
+        (
+            "远程端口",
+            view.forwarding.form.remote_port.clone(),
+            false,
+            true,
+        ),
     ]
 }
 
@@ -358,10 +379,10 @@ fn configure_form_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<Form
             let enable_view = enable_view.clone();
             let test_view = test_view.clone();
             let keep_alive_view = view.clone();
-            let hosts = view.read(cx).jump_hosts.clone();
-            let selected = view.read(cx).selected_jump_host_id.clone();
-            let host_search = view.read(cx).forward_host_picker_search.clone();
-            let keep_alive = view.read(cx).form_keep_alive;
+            let hosts = view.read(cx).servers.jump_hosts.clone();
+            let selected = view.read(cx).servers.selected_jump_host_id.clone();
+            let host_search = view.read(cx).forwarding.host_picker_search.clone();
+            let keep_alive = view.read(cx).forwarding.form_keep_alive;
             let picker_view = view.clone();
             content
                 .w_full()
@@ -393,7 +414,7 @@ fn configure_form_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<Form
                                         .child("*"),
                                 ),
                         )
-                        .child(super::jump_host_picker::render(
+                        .child(jump_host_picker::render(
                             "forward-host-picker",
                             &hosts,
                             &host_search,
@@ -466,8 +487,10 @@ fn configure_form_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<Form
                                 )
                                 .child(
                                     div().w(px(180.)).child(
-                                        Input::new(&view.read(cx).form.keep_alive_interval)
-                                            .disabled(!keep_alive),
+                                        Input::new(
+                                            &view.read(cx).forwarding.form.keep_alive_interval,
+                                        )
+                                        .disabled(!keep_alive),
                                     ),
                                 ),
                         )
@@ -532,8 +555,8 @@ fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoEleme
                 .primary()
                 .icon(IconName::Plus)
                 .label("新增配置")
-                .disabled(view_state.jump_hosts.is_empty())
-                .tooltip(if view_state.jump_hosts.is_empty() {
+                .disabled(view_state.servers.jump_hosts.is_empty())
+                .tooltip(if view_state.servers.jump_hosts.is_empty() {
                     "请先新增服务器"
                 } else {
                     "新增本地转发配置"
@@ -569,17 +592,15 @@ fn open_edit_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
     });
 }
 
-pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub(in crate::ui) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
     let dialog = add_dialog(view_state, cx).into_any_element();
     let view = cx.entity();
-    let search = view_state
-        .forward_search
-        .read(cx)
-        .value()
-        .trim()
-        .to_lowercase();
+    let search =
+        crate::ui::search::RegexSearch::new(view_state.forwarding.search.read(cx).value().as_ref());
+    let search_error = search.error().map(ToOwned::to_owned);
     let jump_host_label = |item: &crate::forward::ForwardConfig| {
         view_state
+            .servers
             .jump_hosts
             .iter()
             .find(|host| host.id == item.jump_host_id)
@@ -593,6 +614,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
     };
     let state_of = |item: &crate::forward::ForwardConfig| {
         if view_state
+            .forwarding
             .tunnels
             .get(&item.id)
             .is_some_and(|handle| !handle.is_running())
@@ -600,25 +622,24 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
             ForwardState::Failed("本地监听线程已退出，请查看日志".into())
         } else {
             view_state
-                .forward_states
+                .forwarding
+                .states
                 .get(&item.id)
                 .cloned()
                 .unwrap_or(ForwardState::Stopped)
         }
     };
     let filtered = view_state
-        .forwards
+        .forwarding
+        .configs
         .iter()
         .filter(|item| {
-            let matches_search = search.is_empty()
-                || item.name.to_lowercase().contains(&search)
-                || item.local_port.to_string().contains(&search)
-                || format!("{}:{}", item.remote_ip, item.remote_port)
-                    .to_lowercase()
-                    .contains(&search)
-                || jump_host_label(item).to_lowercase().contains(&search);
+            let matches_search = search.matches(&item.name)
+                || search.matches(&item.local_port.to_string())
+                || search.matches(&format!("{}:{}", item.remote_ip, item.remote_port))
+                || search.matches(&jump_host_label(item));
             let state = state_of(item);
-            let matches_status = match view_state.forward_status_filter {
+            let matches_status = match view_state.forwarding.status_filter {
                 ForwardStatusFilter::All => true,
                 ForwardStatusFilter::Running => {
                     matches!(state, ForwardState::Starting | ForwardState::Running)
@@ -636,28 +657,28 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
     let all_selected = !visible_ids.is_empty()
         && visible_ids
             .iter()
-            .all(|id| view_state.selected.contains(id));
+            .all(|id| view_state.forwarding.selected.contains(id));
     let filtered_len = filtered.len();
     let start_selected_view = view.clone();
     let stop_selected_view = view.clone();
     let delete_selected_view = view.clone();
-    let has_selection = !view_state.selected.is_empty();
+    let has_selection = !view_state.forwarding.selected.is_empty();
     let rows = filtered
         .into_iter()
         .map(|item| ForwardTableRow {
             item: item.clone(),
             host_label: jump_host_label(item),
             state: state_of(item),
-            selected: view_state.selected.contains(&item.id),
-            can_edit: !view_state.tunnels.contains_key(&item.id),
+            selected: view_state.forwarding.selected.contains(&item.id),
+            can_edit: !view_state.forwarding.tunnels.contains_key(&item.id),
         })
         .collect();
-    let empty_message = if view_state.forwards.is_empty() {
+    let empty_message = if view_state.forwarding.configs.is_empty() {
         "暂无配置，点击右上角“新增配置”开始"
     } else {
         "没有符合搜索或状态条件的配置"
     };
-    view_state.forward_table.update(cx, |table, cx| {
+    view_state.forwarding.table.update(cx, |table, cx| {
         table
             .delegate_mut()
             .update_rows(rows, visible_ids, all_selected, empty_message.into());
@@ -691,10 +712,18 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                     h_flex()
                         .gap_2()
                         .child(
-                            div().w(px(330.)).child(
-                                Input::new(&view_state.forward_search)
-                                    .prefix(Icon::new(IconName::Search).small()),
-                            ),
+                            v_flex()
+                                .w(px(330.))
+                                .gap_1()
+                                .child(
+                                    Input::new(&view_state.forwarding.search)
+                                        .prefix(Icon::new(IconName::Search).small()),
+                                )
+                                .when_some(search_error, |field, error| {
+                                    field.child(
+                                        div().text_xs().text_color(cx.theme().danger).child(error),
+                                    )
+                                }),
                         )
                         .children(
                             [
@@ -708,16 +737,16 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                                 let filter_view = view.clone();
                                 Button::new(id)
                                     .small()
-                                    .when(view_state.forward_status_filter == filter, |button| {
+                                    .when(view_state.forwarding.status_filter == filter, |button| {
                                         button.primary()
                                     })
-                                    .when(view_state.forward_status_filter != filter, |button| {
+                                    .when(view_state.forwarding.status_filter != filter, |button| {
                                         button.outline()
                                     })
                                     .label(label)
                                     .on_click(move |_, _, cx| {
                                         filter_view.update(cx, |this, cx| {
-                                            this.forward_status_filter = filter;
+                                            this.forwarding.status_filter = filter;
                                             cx.notify();
                                         });
                                     })
@@ -734,7 +763,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
                                 .child(format!(
                                     "显示 {} 项 · 已选择 {} 项",
                                     filtered_len,
-                                    view_state.selected.len()
+                                    view_state.forwarding.selected.len()
                                 )),
                         )
                         .child(
@@ -781,7 +810,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElem
         )
         .child(
             div().flex_1().min_h_0().overflow_hidden().child(
-                DataTable::new(&view_state.forward_table)
+                DataTable::new(&view_state.forwarding.table)
                     .bordered(true)
                     .scrollbar_visible(true, true),
             ),
