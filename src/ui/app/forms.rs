@@ -1,7 +1,7 @@
 //! 服务器与端口转发表单状态。
 
 use gpui::*;
-use gpui_component::input::InputState;
+use gpui_component::input::{InputState, TabSize};
 
 pub(in crate::ui) struct ForwardForm {
     pub(in crate::ui) name: Entity<InputState>,
@@ -49,9 +49,15 @@ pub(in crate::ui) struct JumpHostForm {
 impl JumpHostForm {
     pub(in crate::ui) fn new(window: &mut Window, cx: &mut App) -> Self {
         let batch_entries = cx.new(|cx| {
-            InputState::new(window, cx).multi_line(true).placeholder(
-                "每行一台：服务器名称, SSH地址\n例如：\n生产-01, 10.0.0.11\n生产-02, 10.0.0.12",
-            )
+            InputState::new(window, cx)
+                .multi_line(true)
+                .tab_size(TabSize {
+                    tab_size: 4,
+                    hard_tabs: true,
+                })
+                .placeholder(
+                    "每行一台：服务器名称, SSH地址\n例如：\n生产-01, 10.0.0.11\n生产-02, 10.0.0.12",
+                )
         });
         let batch_separator = cx.new(|cx| {
             InputState::new(window, cx)

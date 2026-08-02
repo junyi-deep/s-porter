@@ -20,11 +20,11 @@ impl AppView {
         let view = cx.entity();
         let tab_id = id.to_string();
         let kind = if is_dir { "文件夹" } else { "文件" };
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, _| {
             let create_view = view.clone();
             let create_name = name.clone();
             let create_tab_id = tab_id.clone();
-            dialog
+            crate::ui::dialog_layout::responsive_dialog(dialog, window)
                 .title(format!("新建{kind}"))
                 .w(px(420.))
                 .child(Input::new(&name))
@@ -151,11 +151,11 @@ impl AppView {
         } else {
             format!("确定删除远程文件“{}”吗？此操作无法撤销。", entry.name)
         };
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, _| {
             let delete_view = view.clone();
             let delete_id = tab_id.clone();
             let delete_entry = entry.clone();
-            dialog
+            crate::ui::dialog_layout::responsive_dialog(dialog, window)
                 .title(format!("删除{kind}"))
                 .w(px(460.))
                 .child(div().text_sm().child(warning.clone()))

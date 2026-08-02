@@ -1,4 +1,5 @@
 mod app;
+mod dialog_layout;
 mod forwarding;
 mod search;
 mod server;

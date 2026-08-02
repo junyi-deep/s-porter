@@ -25,6 +25,7 @@ pub(in crate::ui) struct ServerWorkspace {
     pub(in crate::ui) selected_jump_host_id: Option<String>,
     pub(in crate::ui) form: JumpHostForm,
     pub(in crate::ui) form_error: Option<String>,
+    pub(in crate::ui) batch_entries_error: Option<String>,
     pub(in crate::ui) editing_id: Option<String>,
     pub(in crate::ui) batch_mode: bool,
     pub(in crate::ui) search: Entity<InputState>,

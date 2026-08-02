@@ -141,24 +141,23 @@ fn parse_jump_host_batch_entries(
         if line.is_empty() {
             continue;
         }
-        let pair = if let Some(separator) = custom_separator {
-            line.split_once(separator)
+        let columns = if let Some(separator) = custom_separator {
+            line.split(separator).map(str::trim).collect::<Vec<_>>()
         } else {
-            [',', '，', '|', '\t']
+            ['\t', ',', '，', '|']
                 .into_iter()
-                .find_map(|separator| line.split_once(separator))
-                .or_else(|| {
-                    line.char_indices()
-                        .rev()
-                        .find(|(_, character)| character.is_whitespace())
-                        .map(|(index, _)| line.split_at(index))
-                })
+                .find(|separator| line.contains(*separator))
+                .map(|separator| line.split(separator).map(str::trim).collect::<Vec<_>>())
+                .unwrap_or_else(|| line.split_whitespace().collect::<Vec<_>>())
         };
-        let Some((name, host)) = pair else {
-            anyhow::bail!("第 {} 行格式错误，请使用名称与 SSH 地址分隔符", index + 1);
-        };
-        let name = name.trim();
-        let host = host.trim();
+        anyhow::ensure!(
+            columns.len() == 2,
+            "第 {} 行必须且只能包含两列（服务器名称和 SSH 地址），当前识别到 {} 列",
+            index + 1,
+            columns.len()
+        );
+        let name = columns[0];
+        let host = columns[1];
         anyhow::ensure!(!name.is_empty(), "第 {} 行服务器名称不能为空", index + 1);
         anyhow::ensure!(!host.is_empty(), "第 {} 行 SSH 地址不能为空", index + 1);
         entries.push((name.to_string(), host.to_string()));
@@ -201,6 +200,9 @@ impl AppView {
             cx.new(|cx| InputState::new(window, cx).placeholder("正则搜索服务器"));
         let ssh_host_picker_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("正则搜索服务器"));
+        let jump_host_form = JumpHostForm::new(window, cx);
+        let batch_entries = jump_host_form.batch_entries.clone();
+        let batch_separator = jump_host_form.batch_separator.clone();
         let message_center = cx.new(|cx| message_center::MessageCenter::new(window, cx));
         let updates = cx.new(|cx| update_page::UpdateModel::new(distribution, window, cx));
         let app_view = cx.entity();
@@ -247,6 +249,16 @@ impl AppView {
                     cx.notify();
                 }
             }),
+            cx.subscribe(&batch_entries, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) && this.servers.batch_mode {
+                    this.validate_jump_host_batch_entries(false, cx);
+                }
+            }),
+            cx.subscribe(&batch_separator, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) && this.servers.batch_mode {
+                    this.validate_jump_host_batch_entries(false, cx);
+                }
+            }),
             cx.subscribe(&message_center, |_, _, event, cx| {
                 if matches!(event, message_center::MessageCenterEvent::HistoryChanged) {
                     cx.notify();
@@ -278,8 +290,9 @@ impl AppView {
             servers: ServerWorkspace {
                 jump_hosts: config.jump_hosts,
                 selected_jump_host_id,
-                form: JumpHostForm::new(window, cx),
+                form: jump_host_form,
                 form_error: None,
+                batch_entries_error: None,
                 editing_id: None,
                 batch_mode: false,
                 search: jump_host_search,
@@ -421,9 +434,9 @@ impl Render for AppView {
             Some(sidebar::render(self, cx).into_any_element())
         };
         let page_content = match self.navigation.page {
-            Page::JumpHosts => jump_host_page::render(self, cx),
+            Page::JumpHosts => jump_host_page::render(self, window, cx),
             Page::Ssh => ssh_page::render(self, cx),
-            Page::Forward => forward_page::render(self, cx),
+            Page::Forward => forward_page::render(self, window, cx),
             Page::Crypto => {
                 tool_page::render(self.crypto_tools.clone(), message_center.clone(), true, cx)
             }
@@ -601,7 +614,7 @@ mod tests {
     #[test]
     fn parses_batch_jump_hosts_with_supported_separators() {
         let entries = parse_jump_host_batch_entries(
-            "生产-01, 10.0.0.11\n生产-02，10.0.0.12\n测试机|ssh.example.com\n预发机\t10.0.0.13\n有空格的 名称 10.0.0.14",
+            "生产-01, 10.0.0.11\n生产-02，10.0.0.12\n测试机|ssh.example.com\n预发机\t10.0.0.13\n开发机 10.0.0.14",
             "",
         )
         .unwrap();
@@ -612,7 +625,7 @@ mod tests {
                 ("生产-02".into(), "10.0.0.12".into()),
                 ("测试机".into(), "ssh.example.com".into()),
                 ("预发机".into(), "10.0.0.13".into()),
-                ("有空格的 名称".into(), "10.0.0.14".into()),
+                ("开发机".into(), "10.0.0.14".into()),
             ]
         );
         assert_eq!(
@@ -624,7 +637,9 @@ mod tests {
     #[test]
     fn rejects_invalid_batch_jump_host_line() {
         let error = parse_jump_host_batch_entries("缺少分隔符", "").unwrap_err();
-        assert!(error.to_string().contains("第 1 行格式错误"));
+        assert!(error.to_string().contains("当前识别到 1 列"));
+        let error = parse_jump_host_batch_entries("服务器一\t10.0.0.1\t多余列", "").unwrap_err();
+        assert!(error.to_string().contains("当前识别到 3 列"));
     }
 
     #[test]

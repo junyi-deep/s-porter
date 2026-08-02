@@ -3,6 +3,7 @@ use crate::ui::{
         AppView,
         ui_state::{ForwardState, ForwardStatusFilter},
     },
+    dialog_layout::{responsive_dialog, scrollable_dialog_body},
     server::picker as jump_host_picker,
 };
 use gpui::prelude::FluentBuilder as _;
@@ -367,25 +368,59 @@ fn form_inputs(view: &AppView) -> Vec<FormInput> {
     ]
 }
 
-fn configure_form_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<FormInput>) -> Dialog {
+fn configure_form_dialog(
+    dialog: Dialog,
+    view: Entity<AppView>,
+    inputs: Vec<FormInput>,
+    window: &Window,
+) -> Dialog {
     let save_view = view.clone();
     let test_view = view.clone();
     let enable_view = view.clone();
-    dialog
+    let footer = DialogFooter::new()
+        .p_4()
+        .justify_between()
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("form-enable")
+                        .outline()
+                        .label("开启允许转发")
+                        .on_click(move |_, window, cx| {
+                            enable_view.update(cx, |this, cx| this.run_form_ssh(true, window, cx));
+                        }),
+                )
+                .child(
+                    Button::new("form-test")
+                        .outline()
+                        .label("测试连接")
+                        .on_click(move |_, window, cx| {
+                            test_view.update(cx, |this, cx| this.run_form_ssh(false, window, cx));
+                        }),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(DialogClose::new().child(Button::new("cancel-add").outline().label("取消")))
+                .child(DialogAction::new().child(Button::new("save-add").primary().label("保存"))),
+        );
+    responsive_dialog(dialog, window)
         .width(px(720.))
         .on_ok(move |_, window, cx| save_view.update(cx, |this, cx| this.save_form(window, cx)))
         .p_0()
-        .content(move |content, _, cx| {
-            let enable_view = enable_view.clone();
-            let test_view = test_view.clone();
+        .footer(footer)
+        .content(move |content, window, cx| {
             let keep_alive_view = view.clone();
             let hosts = view.read(cx).servers.jump_hosts.clone();
             let selected = view.read(cx).servers.selected_jump_host_id.clone();
             let host_search = view.read(cx).forwarding.host_picker_search.clone();
             let keep_alive = view.read(cx).forwarding.form_keep_alive;
             let picker_view = view.clone();
-            content
+            let body = v_flex()
                 .w_full()
+                .min_w_0()
                 .child(
                     DialogHeader::new()
                         .p_5()
@@ -500,74 +535,39 @@ fn configure_form_dialog(dialog: Dialog, view: Entity<AppView>, inputs: Vec<Form
                                 .text_color(cx.theme().muted_foreground)
                                 .child("建议 30 秒，可设置 2–3600 秒"),
                         ),
-                )
-                .child(
-                    DialogFooter::new()
-                        .p_4()
-                        .bg(cx.theme().muted)
-                        .justify_between()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("form-enable")
-                                        .outline()
-                                        .label("开启允许转发")
-                                        .on_click(move |_, window, cx| {
-                                            enable_view.update(cx, |this, cx| {
-                                                this.run_form_ssh(true, window, cx)
-                                            });
-                                        }),
-                                )
-                                .child(
-                                    Button::new("form-test")
-                                        .outline()
-                                        .label("测试连接")
-                                        .on_click(move |_, window, cx| {
-                                            test_view.update(cx, |this, cx| {
-                                                this.run_form_ssh(false, window, cx)
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    DialogClose::new()
-                                        .child(Button::new("cancel-add").outline().label("取消")),
-                                )
-                                .child(
-                                    DialogAction::new()
-                                        .child(Button::new("save-add").primary().label("保存")),
-                                ),
-                        ),
-                )
+                );
+            content.min_h_0().child(scrollable_dialog_body(
+                "forward-dialog-scroll",
+                body,
+                window,
+            ))
         })
 }
 
-fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoElement {
+fn add_dialog(
+    view_state: &AppView,
+    _window: &Window,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
     let view = cx.entity();
-    let reset_view = view.clone();
-    configure_form_dialog(
-        Dialog::new(cx).trigger(
-            Button::new("add-forward")
-                .primary()
-                .icon(IconName::Plus)
-                .label("新增配置")
-                .disabled(view_state.servers.jump_hosts.is_empty())
-                .tooltip(if view_state.servers.jump_hosts.is_empty() {
-                    "请先新增服务器"
-                } else {
-                    "新增本地转发配置"
-                })
-                .on_click(move |_, window, cx| {
-                    reset_view.update(cx, |this, cx| this.prepare_new_form(window, cx));
-                }),
-        ),
-        view,
-        form_inputs(view_state),
-    )
+    Button::new("add-forward")
+        .primary()
+        .icon(IconName::Plus)
+        .label("新增配置")
+        .disabled(view_state.servers.jump_hosts.is_empty())
+        .tooltip(if view_state.servers.jump_hosts.is_empty() {
+            "请先新增服务器"
+        } else {
+            "新增本地转发配置"
+        })
+        .on_click(move |_, window, cx| {
+            view.update(cx, |this, cx| this.prepare_new_form(window, cx));
+            let inputs = form_inputs(view.read(cx));
+            let dialog_view = view.clone();
+            window.open_dialog(cx, move |dialog, window, _| {
+                configure_form_dialog(dialog, dialog_view.clone(), inputs.clone(), window)
+            });
+        })
 }
 
 fn open_clone_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: &mut App) {
@@ -575,8 +575,8 @@ fn open_clone_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx:
         return;
     }
     let inputs = form_inputs(view.read(cx));
-    window.open_dialog(cx, move |dialog, _, _| {
-        configure_form_dialog(dialog, view.clone(), inputs.clone())
+    window.open_dialog(cx, move |dialog, window, _| {
+        configure_form_dialog(dialog, view.clone(), inputs.clone(), window)
     });
 }
 
@@ -587,13 +587,17 @@ fn open_edit_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
         return;
     }
     let inputs = form_inputs(view.read(cx));
-    window.open_dialog(cx, move |dialog, _, _| {
-        configure_form_dialog(dialog, view.clone(), inputs.clone())
+    window.open_dialog(cx, move |dialog, window, _| {
+        configure_form_dialog(dialog, view.clone(), inputs.clone(), window)
     });
 }
 
-pub(in crate::ui) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
-    let dialog = add_dialog(view_state, cx).into_any_element();
+pub(in crate::ui) fn render(
+    view_state: &AppView,
+    window: &Window,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let dialog = add_dialog(view_state, window, cx).into_any_element();
     let view = cx.entity();
     let search =
         crate::ui::search::RegexSearch::new(view_state.forwarding.search.read(cx).value().as_ref());

@@ -1,8 +1,10 @@
 //! 应用级消息中心实体与视图。
 
 use chrono::Local;
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
+    button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     notification::Notification,
     scroll::ScrollableElement,
@@ -161,10 +163,30 @@ pub(in crate::ui) fn push(
     let text = message.into();
     let notification_text = text.clone();
     let id = center.update(cx, |center, cx| center.push(text, cx));
+    let show_close_all = window.notifications(cx).len() >= 1;
+    let close_all_button_id = format!("close-all-notifications-{id}");
     window.push_notification(
         Notification::new().content(move |_, _, _| {
-            TextView::markdown(format!("notification-{id}"), notification_text.clone())
-                .selectable(true)
+            v_flex()
+                .gap_2()
+                .child(
+                    TextView::markdown(format!("notification-{id}"), notification_text.clone())
+                        .selectable(true),
+                )
+                .when(show_close_all, |content| {
+                    content.child(
+                        h_flex().justify_end().child(
+                            Button::new(close_all_button_id.clone())
+                                .xsmall()
+                                .ghost()
+                                .label("关闭全部")
+                                .on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.clear_notifications(cx);
+                                }),
+                        ),
+                    )
+                })
                 .into_any_element()
         }),
         cx,
@@ -174,10 +196,27 @@ pub(in crate::ui) fn push(
 pub(in crate::ui) fn show_hint(message: impl Into<String>, window: &mut Window, cx: &mut App) {
     let text = message.into();
     let id = uuid::Uuid::new_v4().to_string();
+    let show_close_all = window.notifications(cx).len() >= 1;
+    let close_all_button_id = format!("close-all-hints-{id}");
     window.push_notification(
         Notification::new().content(move |_, _, _| {
-            TextView::markdown(format!("hint-{id}"), text.clone())
-                .selectable(true)
+            v_flex()
+                .gap_2()
+                .child(TextView::markdown(format!("hint-{id}"), text.clone()).selectable(true))
+                .when(show_close_all, |content| {
+                    content.child(
+                        h_flex().justify_end().child(
+                            Button::new(close_all_button_id.clone())
+                                .xsmall()
+                                .ghost()
+                                .label("关闭全部")
+                                .on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.clear_notifications(cx);
+                                }),
+                        ),
+                    )
+                })
                 .into_any_element()
         }),
         cx,

@@ -11,6 +11,7 @@ impl AppView {
         self.servers.editing_id = None;
         self.servers.batch_mode = false;
         self.servers.form_error = None;
+        self.servers.batch_entries_error = None;
         let values = [
             (&self.servers.form.name, ""),
             (&self.servers.form.host, ""),
@@ -60,6 +61,7 @@ impl AppView {
         self.servers.editing_id = Some(host.id);
         self.servers.batch_mode = false;
         self.servers.form_error = None;
+        self.servers.batch_entries_error = None;
         let values = [
             (&self.servers.form.name, host.name),
             (&self.servers.form.host, host.host),
@@ -117,6 +119,7 @@ impl AppView {
         self.servers.editing_id = None;
         self.servers.batch_mode = false;
         self.servers.form_error = None;
+        self.servers.batch_entries_error = None;
         let values = [
             (&self.servers.form.name, copy_name),
             (&self.servers.form.host, host.host),
@@ -219,11 +222,40 @@ impl AppView {
             .collect()
     }
 
+    pub(in crate::ui) fn validate_jump_host_batch_entries(
+        &mut self,
+        require_non_empty: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let source = self.servers.form.batch_entries.read(cx).value().to_string();
+        if !require_non_empty && source.trim().is_empty() {
+            self.servers.batch_entries_error = None;
+            cx.notify();
+            return true;
+        }
+        let separator = self
+            .servers
+            .form
+            .batch_separator
+            .read(cx)
+            .value()
+            .to_string();
+        self.servers.batch_entries_error = parse_jump_host_batch_entries(&source, &separator)
+            .err()
+            .map(|error| error.to_string());
+        cx.notify();
+        self.servers.batch_entries_error.is_none()
+    }
+
     pub(in crate::ui) fn save_jump_host(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.servers.batch_mode && !self.validate_jump_host_batch_entries(true, cx) {
+            self.servers.form_error = None;
+            return false;
+        }
         let hosts = match if self.servers.batch_mode {
             self.jump_host_batch_values(cx)
         } else {
@@ -261,6 +293,7 @@ impl AppView {
             return false;
         }
         self.servers.form_error = None;
+        self.servers.batch_entries_error = None;
         self.servers.jump_hosts = next;
         if let Some(host) = hosts.first() {
             self.servers
@@ -386,10 +419,10 @@ impl AppView {
             format!("确认批量删除 {} 台服务器？", hosts.len())
         };
         let view = cx.entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, window, _| {
             let delete_ids = ids.clone();
             let delete_view = view.clone();
-            dialog
+            crate::ui::dialog_layout::responsive_dialog(dialog, window)
                 .title(title.clone())
                 .w(px(620.))
                 .footer(
@@ -413,7 +446,7 @@ impl AppView {
                         .gap_2()
                         .child("删除后将同时停止并清理以下关联项：")
                         .child(
-                            div().max_h(px(480.)).overflow_y_scrollbar().child(
+                            div().max_h(px(480.)).overflow_scrollbar().child(
                                 TextView::markdown(
                                     format!("delete-jump-hosts-{}", delete_ids.join("-")),
                                     details.clone(),

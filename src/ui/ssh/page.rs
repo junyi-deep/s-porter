@@ -7,6 +7,7 @@ use super::{
 };
 use crate::forward::TransferStage;
 use crate::ui::app::{AppView, UI_FONT_SIZES};
+use crate::ui::dialog_layout::responsive_dialog;
 use gpui::InteractiveElement as _;
 use gpui::StatefulInteractiveElement as _;
 use gpui::prelude::FluentBuilder as _;
@@ -54,14 +55,14 @@ fn open_quick_command_dialog(
             .default_value(command_value)
             .placeholder("输入具体命令")
     });
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, window, _| {
         let save_view = view.clone();
         let delete_view = view.clone();
         let save_name = name.clone();
         let save_command = command.clone();
         let save_id = editing_id.clone();
         let delete_id = editing_id.clone();
-        dialog
+        responsive_dialog(dialog, window)
             .title(if editing_id.is_some() {
                 "编辑快捷命令"
             } else {
@@ -140,8 +141,8 @@ fn open_connection_dialog(
     window: &mut Window,
     cx: &mut App,
 ) {
-    window.open_dialog(cx, move |dialog, _, _| {
-        dialog
+    window.open_dialog(cx, move |dialog, window, _| {
+        responsive_dialog(dialog, window)
             .title("选择服务器")
             .w(px(440.))
             .content({

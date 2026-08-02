@@ -267,13 +267,17 @@ impl AppView {
             logs = "该转发尚无运行日志。".into();
         }
         let log_view_id = format!("forward-log-{id}");
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("转发日志").w(px(680.)).min_h(px(280.)).child(
-                div().max_h(px(520.)).overflow_hidden().child(
-                    TextView::markdown(log_view_id.clone(), format!("```text\n{logs}\n```"))
-                        .selectable(true),
-                ),
-            )
+        window.open_dialog(cx, move |dialog, window, _| {
+            crate::ui::dialog_layout::responsive_dialog(dialog, window)
+                .title("转发日志")
+                .w(px(680.))
+                .min_h(px(280.))
+                .child(
+                    div().max_h(px(520.)).overflow_scrollbar().child(
+                        TextView::markdown(log_view_id.clone(), format!("```text\n{logs}\n```"))
+                            .selectable(true),
+                    ),
+                )
         });
     }
 }

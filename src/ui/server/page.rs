@@ -1,4 +1,7 @@
-use crate::ui::app::AppView;
+use crate::ui::{
+    app::AppView,
+    dialog_layout::{responsive_dialog, scrollable_dialog_body},
+};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -333,11 +336,47 @@ fn configure_dialog(
     view: Entity<AppView>,
     inputs: Vec<FormInput>,
     is_batch: bool,
+    window: &Window,
 ) -> Dialog {
     let keyboard_save_view = view.clone();
     let button_save_view = view.clone();
     let test_view = view.clone();
-    dialog
+    let footer = DialogFooter::new()
+        .p_4()
+        .justify_between()
+        .when(!is_batch, |footer| {
+            footer.child(
+                Button::new("test-jump-host")
+                    .outline()
+                    .label("测试连通性")
+                    .on_click(move |_, window, cx| {
+                        test_view.update(cx, |this, cx| this.test_jump_host_form(window, cx));
+                    }),
+            )
+        })
+        .when(is_batch, |footer| footer.child(div()))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    DialogClose::new()
+                        .child(Button::new("cancel-jump-host").outline().label("取消")),
+                )
+                .child(
+                    Button::new("save-jump-host")
+                        .primary()
+                        .label("保存")
+                        .on_click(move |_, window, cx| {
+                            if button_save_view.update(cx, |this, cx| {
+                                this.servers.batch_mode = is_batch;
+                                this.save_jump_host(window, cx)
+                            }) {
+                                window.close_dialog(cx);
+                            }
+                        }),
+                ),
+        );
+    responsive_dialog(dialog, window)
         .width(px(820.))
         .on_ok(move |_, window, cx| {
             keyboard_save_view.update(cx, |this, cx| {
@@ -346,16 +385,17 @@ fn configure_dialog(
             })
         })
         .p_0()
-        .content(move |content, _, cx| {
+        .footer(footer)
+        .content(move |content, window, cx| {
             let view_state = view.read(cx);
             let is_editing = view_state.servers.editing_id.is_some();
             let batch_entries = view_state.servers.form.batch_entries.clone();
             let batch_separator = view_state.servers.form.batch_separator.clone();
+            let batch_entries_error = view_state.servers.batch_entries_error.clone();
             let form_error = view_state.servers.form_error.clone();
-            let test_view = test_view.clone();
-            let save_view = button_save_view.clone();
-            content
+            let body = v_flex()
                 .w_full()
+                .min_w_0()
                 .child(
                     DialogHeader::new()
                         .p_5()
@@ -411,8 +451,23 @@ fn configure_dialog(
                             .child(
                                 div()
                                     .h(px(150.))
-                                    .child(Input::new(&batch_entries).h_full()),
+                                    .child(
+                                        Input::new(&batch_entries)
+                                            .h_full()
+                                            .font_family("monospace"),
+                                    ),
                             )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("支持直接粘贴 Excel 两列数据，Tab 将保留为列分隔符"),
+                            )
+                            .when_some(batch_entries_error, |fields, error| {
+                                fields.child(
+                                    div().text_xs().text_color(cx.theme().danger).child(error),
+                                )
+                            })
                             .child(
                                 div()
                                     .mt_2()
@@ -446,6 +501,9 @@ fn configure_dialog(
                                         .when(*label == "服务器名称", |field| {
                                             field.col_span_full()
                                         })
+                                        .when(is_batch && *label == "SSH 端口", |field| {
+                                            field.col_span_full()
+                                        })
                                         .child(
                                             h_flex()
                                                 .gap_1()
@@ -467,84 +525,49 @@ fn configure_dialog(
                                         }))
                                 }),
                         ),
-                )
-                .child(
-                    DialogFooter::new()
-                        .p_4()
-                        .bg(cx.theme().muted)
-                        .justify_between()
-                        .when(!is_batch, |footer| {
-                            footer.child(
-                                Button::new("test-jump-host")
-                                    .outline()
-                                    .label("测试连通性")
-                                    .on_click(move |_, window, cx| {
-                                        test_view.update(cx, |this, cx| {
-                                            this.test_jump_host_form(window, cx)
-                                        });
-                                    }),
-                            )
-                        })
-                        .when(is_batch, |footer| footer.child(div()))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    DialogClose::new().child(
-                                        Button::new("cancel-jump-host").outline().label("取消"),
-                                    ),
-                                )
-                                .child(
-                                    Button::new("save-jump-host")
-                                        .primary()
-                                        .label("保存")
-                                        .on_click(move |_, window, cx| {
-                                            if save_view.update(cx, |this, cx| {
-                                                this.servers.batch_mode = is_batch;
-                                                this.save_jump_host(window, cx)
-                                            }) {
-                                                window.close_dialog(cx);
-                                            }
-                                        }),
-                                ),
-                        ),
-                )
+                );
+            content
+                .min_h_0()
+                .child(scrollable_dialog_body(
+                    "server-dialog-scroll",
+                    body,
+                    window,
+                ))
         })
 }
 
-fn add_dialog(view_state: &AppView, cx: &mut Context<AppView>) -> impl IntoElement {
+fn add_dialog(
+    _view_state: &AppView,
+    _window: &Window,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
     let view = cx.entity();
-    let reset_view = view.clone();
+    let single_view = view.clone();
     let batch_view = view.clone();
-    let inputs = form_inputs(view_state);
-    let single = configure_dialog(
-        Dialog::new(cx).trigger(
-            Button::new("add-jump-host")
-                .primary()
-                .icon(IconName::Plus)
-                .label("新增服务器")
-                .on_click(move |_, window, cx| {
-                    reset_view.update(cx, |this, cx| this.prepare_new_jump_host(window, cx));
-                }),
-        ),
-        view.clone(),
-        inputs.clone(),
-        false,
-    );
-    let batch = configure_dialog(
-        Dialog::new(cx).trigger(
-            Button::new("batch-add-jump-host")
-                .outline()
-                .icon(IconName::Plus)
-                .label("批量新增服务器")
-                .on_click(move |_, window, cx| {
-                    batch_view.update(cx, |this, cx| this.prepare_batch_jump_hosts(window, cx));
-                }),
-        ),
-        view,
-        inputs,
-        true,
-    );
+    let single = Button::new("add-jump-host")
+        .primary()
+        .icon(IconName::Plus)
+        .label("新增服务器")
+        .on_click(move |_, window, cx| {
+            single_view.update(cx, |this, cx| this.prepare_new_jump_host(window, cx));
+            let inputs = form_inputs(single_view.read(cx));
+            let dialog_view = single_view.clone();
+            window.open_dialog(cx, move |dialog, window, _| {
+                configure_dialog(dialog, dialog_view.clone(), inputs.clone(), false, window)
+            });
+        });
+    let batch = Button::new("batch-add-jump-host")
+        .outline()
+        .icon(IconName::Plus)
+        .label("批量新增服务器")
+        .on_click(move |_, window, cx| {
+            batch_view.update(cx, |this, cx| this.prepare_batch_jump_hosts(window, cx));
+            let inputs = form_inputs(batch_view.read(cx));
+            let dialog_view = batch_view.clone();
+            window.open_dialog(cx, move |dialog, window, _| {
+                configure_dialog(dialog, dialog_view.clone(), inputs.clone(), true, window)
+            });
+        });
     h_flex().gap_2().child(single).child(batch)
 }
 
@@ -553,8 +576,8 @@ fn open_edit_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
         return;
     }
     let inputs = form_inputs(view.read(cx));
-    window.open_dialog(cx, move |dialog, _, _| {
-        configure_dialog(dialog, view.clone(), inputs.clone(), false)
+    window.open_dialog(cx, move |dialog, window, _| {
+        configure_dialog(dialog, view.clone(), inputs.clone(), false, window)
     });
 }
 
@@ -563,14 +586,18 @@ fn open_copy_dialog(view: Entity<AppView>, id: String, window: &mut Window, cx: 
         return;
     }
     let inputs = form_inputs(view.read(cx));
-    window.open_dialog(cx, move |dialog, _, _| {
-        configure_dialog(dialog, view.clone(), inputs.clone(), false)
+    window.open_dialog(cx, move |dialog, window, _| {
+        configure_dialog(dialog, view.clone(), inputs.clone(), false, window)
     });
 }
 
-pub(in crate::ui) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+pub(in crate::ui) fn render(
+    view_state: &AppView,
+    window: &Window,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
     let view = cx.entity();
-    let dialog = add_dialog(view_state, cx).into_any_element();
+    let dialog = add_dialog(view_state, window, cx).into_any_element();
     let search =
         crate::ui::search::RegexSearch::new(view_state.servers.search.read(cx).value().as_ref());
     let search_error = search.error().map(ToOwned::to_owned);
