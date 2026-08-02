@@ -18,7 +18,8 @@ path = "src/bin/s-porter-yellow.rs"
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = "fat"
+panic = "abort"
 strip = "symbols"
 
 [dependencies]
@@ -27,7 +28,6 @@ anyhow = "1"
 argon2 = "0.5"
 base64 = "0.22"
 chrono = "0.4"
-chrono-tz = "0.10"
 directories = "6"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
