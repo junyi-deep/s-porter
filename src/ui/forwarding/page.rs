@@ -5,6 +5,7 @@ use crate::ui::{
     },
     dialog_layout::{responsive_dialog, scrollable_dialog_body},
     server::picker as jump_host_picker,
+    table_sort::{MultiSort, compare_address, compare_text},
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -29,6 +30,16 @@ struct ForwardTableRow {
     can_edit: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForwardSortField {
+    Name,
+    LocalPort,
+    RemoteAddress,
+    RemotePort,
+    JumpHost,
+    Status,
+}
+
 pub(in crate::ui) struct ForwardTableDelegate {
     view: WeakEntity<AppView>,
     columns: Vec<Column>,
@@ -36,6 +47,7 @@ pub(in crate::ui) struct ForwardTableDelegate {
     visible_ids: Vec<String>,
     all_selected: bool,
     empty_message: String,
+    sort: MultiSort<ForwardSortField>,
 }
 
 impl ForwardTableDelegate {
@@ -59,11 +71,16 @@ impl ForwardTableDelegate {
                     .width(px(125.))
                     .min_width(px(95.))
                     .max_width(px(240.)),
-                Column::new("remote", "远程目标")
+                Column::new("remote_address", "远程 IP / 域名")
                     .p_0()
                     .width(px(170.))
                     .min_width(px(110.))
                     .max_width(px(360.)),
+                Column::new("remote_port", "远程端口")
+                    .p_0()
+                    .width(px(105.))
+                    .min_width(px(80.))
+                    .max_width(px(190.)),
                 Column::new("jump_host", "服务器")
                     .p_0()
                     .width(px(190.))
@@ -85,7 +102,56 @@ impl ForwardTableDelegate {
             visible_ids: Vec::new(),
             all_selected: false,
             empty_message: "暂无配置，点击右上角“新增配置”开始".into(),
+            sort: MultiSort::default(),
         }
+    }
+
+    fn sort_field(col_ix: usize) -> Option<ForwardSortField> {
+        match col_ix {
+            1 => Some(ForwardSortField::Name),
+            2 => Some(ForwardSortField::LocalPort),
+            3 => Some(ForwardSortField::RemoteAddress),
+            4 => Some(ForwardSortField::RemotePort),
+            5 => Some(ForwardSortField::JumpHost),
+            6 => Some(ForwardSortField::Status),
+            _ => None,
+        }
+    }
+
+    fn state_order(state: &ForwardState) -> u8 {
+        match state {
+            ForwardState::Running => 0,
+            ForwardState::Starting => 1,
+            ForwardState::Stopped => 2,
+            ForwardState::Failed(_) => 3,
+        }
+    }
+
+    fn sort_rows(&mut self) {
+        self.rows.sort_by(|left, right| {
+            self.sort
+                .compare(left, right, |field, left, right| match field {
+                    ForwardSortField::Name => compare_text(&left.item.name, &right.item.name),
+                    ForwardSortField::LocalPort => left.item.local_port.cmp(&right.item.local_port),
+                    ForwardSortField::RemoteAddress => {
+                        compare_address(&left.item.remote_ip, &right.item.remote_ip)
+                    }
+                    ForwardSortField::RemotePort => {
+                        left.item.remote_port.cmp(&right.item.remote_port)
+                    }
+                    ForwardSortField::JumpHost => compare_text(&left.host_label, &right.host_label),
+                    ForwardSortField::Status => {
+                        Self::state_order(&left.state).cmp(&Self::state_order(&right.state))
+                    }
+                })
+                .then_with(|| compare_text(&left.item.name, &right.item.name))
+                .then_with(|| left.item.id.cmp(&right.item.id))
+        });
+    }
+
+    fn toggle_sort(&mut self, field: ForwardSortField, additive: bool) {
+        self.sort.toggle(field, additive);
+        self.sort_rows();
     }
 
     fn update_rows(
@@ -99,6 +165,7 @@ impl ForwardTableDelegate {
         self.visible_ids = visible_ids;
         self.all_selected = all_selected;
         self.empty_message = empty_message;
+        self.sort_rows();
     }
 }
 
@@ -145,8 +212,22 @@ impl TableDelegate for ForwardTableDelegate {
                 )
                 .into_any_element()
         } else {
+            let Some(field) = Self::sort_field(col_ix) else {
+                return header
+                    .child(self.columns[col_ix].name.clone())
+                    .into_any_element();
+            };
+            let label = self.sort.label(field, &self.columns[col_ix].name);
+            let sort_click = cx.listener(move |table, event: &ClickEvent, window, cx| {
+                let additive = event.modifiers().shift || window.modifiers().shift;
+                table.delegate_mut().toggle_sort(field, additive);
+                cx.notify();
+            });
             header
-                .child(self.columns[col_ix].name.clone())
+                .id(("forward-sort", col_ix))
+                .cursor_pointer()
+                .child(label)
+                .on_click(sort_click)
                 .into_any_element()
         }
     }
@@ -196,19 +277,17 @@ impl TableDelegate for ForwardTableDelegate {
                 .into_any_element(),
             3 => cell
                 .child(
-                    TextView::markdown(
-                        format!("remote-{}", item.id),
-                        format!("{}:{}", item.remote_ip, item.remote_port),
-                    )
-                    .selectable(true),
+                    TextView::markdown(format!("remote-{}", item.id), item.remote_ip)
+                        .selectable(true),
                 )
                 .into_any_element(),
-            4 => cell
+            4 => cell.child(item.remote_port.to_string()).into_any_element(),
+            5 => cell
                 .child(
                     TextView::markdown(format!("ssh-{}", item.id), row.host_label).selectable(true),
                 )
                 .into_any_element(),
-            5 => {
+            6 => {
                 let (label, color) = match row.state {
                     ForwardState::Stopped => ("已停止", cx.theme().muted_foreground),
                     ForwardState::Starting => ("启动中", cx.theme().warning),
@@ -722,6 +801,12 @@ pub(in crate::ui) fn render(
                                 .child(
                                     Input::new(&view_state.forwarding.search)
                                         .prefix(Icon::new(IconName::Search).small()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("点击列头设置主排序；Shift + 点击追加低优先级排序"),
                                 )
                                 .when_some(search_error, |field, error| {
                                     field.child(

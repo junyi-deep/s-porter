@@ -296,16 +296,8 @@ impl AppView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let copy_shortcut = if cfg!(target_os = "macos") {
-            event.keystroke.modifiers.platform
-                && !event.keystroke.modifiers.control
-                && event.keystroke.key.eq_ignore_ascii_case("c")
-        } else {
-            event.keystroke.modifiers.control
-                && event.keystroke.modifiers.shift
-                && event.keystroke.key.eq_ignore_ascii_case("c")
-        };
-        if copy_shortcut && self.copy_ssh_terminal_selection(id, cx) {
+        if is_terminal_copy_shortcut(&event.keystroke) {
+            self.copy_ssh_terminal_selection(id, cx);
             return true;
         }
         let Some(tab) = self.ssh.tabs.iter().find(|tab| tab.id == id) else {
@@ -314,25 +306,8 @@ impl AppView {
         let Some(terminal) = tab.terminal.as_ref() else {
             return false;
         };
-        let paste_shortcut = if cfg!(target_os = "macos") {
-            event.keystroke.modifiers.platform
-                && !event.keystroke.modifiers.control
-                && event.keystroke.key.eq_ignore_ascii_case("v")
-        } else {
-            event.keystroke.modifiers.control
-                && event.keystroke.modifiers.shift
-                && event.keystroke.key.eq_ignore_ascii_case("v")
-        };
-        if paste_shortcut {
-            let Some(text) = cx
-                .read_from_clipboard()
-                .and_then(|clipboard| clipboard.text())
-            else {
-                return true;
-            };
-            if let Err(error) = terminal.send_paste(&text) {
-                self.show_ssh_interaction_error(id, format!("粘贴失败：{error:#}"), cx);
-            }
+        if is_terminal_paste_shortcut(&event.keystroke) {
+            self.paste_ssh_terminal_clipboard(id, cx);
             return true;
         }
         let Some(bytes) = terminal_key_bytes(
@@ -347,6 +322,25 @@ impl AppView {
             return false;
         }
         true
+    }
+
+    pub(in crate::ui) fn paste_ssh_terminal_clipboard(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(text) = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| clipboard.text())
+        else {
+            return;
+        };
+        let result = self
+            .ssh
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.terminal.as_ref())
+            .map(|terminal| terminal.send_paste(&text));
+        if let Some(Err(error)) = result {
+            self.show_ssh_interaction_error(id, format!("粘贴失败：{error:#}"), cx);
+        }
     }
 
     pub(in crate::ui) fn send_ssh_terminal_tab(

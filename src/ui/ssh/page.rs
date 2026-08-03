@@ -25,6 +25,9 @@ use gpui_component::{
 };
 
 const DEFAULT_SSH_TERMINAL_FONT_SIZE: f32 = 12.;
+const TERMINAL_LINE_HEIGHT_FACTOR: f32 = 1.45;
+const TERMINAL_ROW_LEFT_PADDING: f32 = 8.;
+const TERMINAL_SCROLLBAR_GUTTER: f32 = 16.;
 use std::{cell::Cell, path::PathBuf, rc::Rc};
 use unicode_width::UnicodeWidthChar as _;
 
@@ -435,6 +438,20 @@ fn terminal_scrollbar_metrics(
     })
 }
 
+fn terminal_grid_size(
+    viewport_width: f32,
+    viewport_height: f32,
+    font_size: f32,
+    cell_width: f32,
+) -> (u16, u16) {
+    // viewport_width 已经是滚动条左侧的真实内容视口，只需扣除文本左边距。
+    let text_width = (viewport_width - TERMINAL_ROW_LEFT_PADDING).max(1.);
+    let text_height = viewport_height.max(1.);
+    let cols = (text_width / cell_width.max(1.)).floor() as u16;
+    let rows = (text_height / (font_size * TERMINAL_LINE_HEIGHT_FACTOR)).floor() as u16;
+    (cols.max(20), rows.max(5))
+}
+
 fn set_terminal_scroll_from_thumb(
     handle: &UniformListScrollHandle,
     metrics: TerminalScrollbarMetrics,
@@ -500,6 +517,8 @@ fn render_terminal(
     let terminal_finish_id = tab.id.clone();
     let terminal_copy_view = view.clone();
     let terminal_copy_id = tab.id.clone();
+    let terminal_paste_view = view.clone();
+    let terminal_paste_id = tab.id.clone();
     let terminal_focus = tab.terminal_focus.clone();
     let terminal_control: Option<crate::forward::SshTerminalControl> =
         tab.terminal.as_ref().map(|terminal| terminal.control());
@@ -513,6 +532,7 @@ fn render_terminal(
     let history_lines_view = view.clone();
     let custom_font_size = tab.terminal_font_size;
     let terminal_font_size = custom_font_size.unwrap_or(DEFAULT_SSH_TERMINAL_FONT_SIZE);
+    let terminal_size = tab.terminal_size.get();
     let terminal_selection = tab.terminal_selection;
     let terminal_scroll_for_selection = tab.terminal_scroll.clone();
     let terminal_search_query = tab.terminal_search.read(cx).value().to_string();
@@ -592,7 +612,13 @@ fn render_terminal(
                     h_flex()
                         .gap_2()
                         .child(div().text_sm().font_semibold().child(tab.title.clone()))
-                        .child(div().text_xs().text_color(status_color).child(status)),
+                        .child(div().text_xs().text_color(status_color).child(status))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{} 列 × {} 行", terminal_size.0, terminal_size.1)),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -796,7 +822,7 @@ fn render_terminal(
         .child(div().flex_1().min_h_0().p_2().bg(rgb(0xffffff)).child({
             let terminal_lines = tab.terminal_lines.clone();
             let line_count = terminal_lines.len();
-            let line_height = terminal_font_size * 1.45;
+            let line_height = terminal_font_size * TERMINAL_LINE_HEIGHT_FACTOR;
             let viewport_height = tab
                 .terminal_viewport_height
                 .get()
@@ -860,180 +886,214 @@ fn render_terminal(
                         cx.stop_propagation();
                     }
                 })
-                .on_prepaint(move |bounds, _, _| {
-                    terminal_left_for_resize.set(f32::from(bounds.origin.x));
-                    terminal_viewport_height.set(f32::from(bounds.size.height));
-                    let Some(control) = terminal_control.as_ref() else {
-                        return;
-                    };
-                    let width = (f32::from(bounds.size.width) - 16.).max(1.);
-                    let height = (f32::from(bounds.size.height) - 16.).max(1.);
-                    let cols = (width / (terminal_font_size * 0.62)).floor() as u16;
-                    let rows = (height / (terminal_font_size * 1.45)).floor() as u16;
-                    let size = (cols.max(20), rows.max(5));
-                    if terminal_size_state.get() != size {
-                        terminal_size_state.set(size);
-                        control.resize(size.0, size.1);
-                    }
-                })
                 .child(
-                    uniform_list(
-                        format!("ssh-terminal-lines-{}", tab.id),
-                        line_count,
-                        move |range, _, _| {
-                            range
-                                .map(|index| {
-                                    let line = &terminal_lines[index];
-                                    let (display_text, cursor_range) =
-                                        terminal_text_with_cursor(line);
-                                    let base_highlights = line.styles.iter().map(|span| {
-                                        (
-                                            terminal_display_range(
-                                                span.range.clone(),
-                                                cursor_range.as_ref(),
-                                            ),
-                                            terminal_highlight(span.style),
-                                        )
-                                    });
-                                    let search_highlights = terminal_search_matches
-                                        .iter()
-                                        .filter(|matched| matched.line == index)
-                                        .map(|matched| {
-                                            let is_active = active_terminal_search_match
-                                                .as_ref()
-                                                .is_some_and(|active| active == matched);
-                                            (
-                                                terminal_display_range(
-                                                    matched.range.clone(),
-                                                    cursor_range.as_ref(),
-                                                ),
-                                                HighlightStyle {
-                                                    background_color: Some(
-                                                        rgb(if is_active {
-                                                            0xf59e0b
-                                                        } else {
-                                                            0xfde68a
-                                                        })
-                                                        .opacity(if is_active { 0.9 } else { 0.65 })
-                                                        .into(),
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right(px(TERMINAL_SCROLLBAR_GUTTER))
+                        .top_0()
+                        .bottom_0()
+                        .on_prepaint(move |bounds, window, _| {
+                            terminal_left_for_resize.set(f32::from(bounds.origin.x));
+                            terminal_viewport_height.set(f32::from(bounds.size.height));
+                            let Some(control) = terminal_control.as_ref() else {
+                                return;
+                            };
+                            let font_id = window.text_system().resolve_font(&font("monospace"));
+                            let cell_width = f32::from(window.text_system().layout_width(
+                                font_id,
+                                px(terminal_font_size),
+                                '0',
+                            ));
+                            let size = terminal_grid_size(
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                                terminal_font_size,
+                                cell_width,
+                            );
+                            if terminal_size_state.get() != size {
+                                terminal_size_state.set(size);
+                                control.resize(size.0, size.1);
+                            }
+                        })
+                        .child(
+                            uniform_list(
+                                format!("ssh-terminal-lines-{}", tab.id),
+                                line_count,
+                                move |range, _, _| {
+                                    range
+                                        .map(|index| {
+                                            let line = &terminal_lines[index];
+                                            let (display_text, cursor_range) =
+                                                terminal_text_with_cursor(line);
+                                            let base_highlights = line.styles.iter().map(|span| {
+                                                (
+                                                    terminal_display_range(
+                                                        span.range.clone(),
+                                                        cursor_range.as_ref(),
                                                     ),
-                                                    color: is_active
-                                                        .then_some(rgb(0x111827).into()),
-                                                    ..HighlightStyle::default()
-                                                },
-                                            )
-                                        });
-                                    let selected = terminal_selection_range(
-                                        index,
-                                        &line.text,
-                                        terminal_selection,
-                                    )
-                                    .map(|range| {
-                                        (
-                                            terminal_display_range(range, cursor_range.as_ref()),
-                                            HighlightStyle {
-                                                background_color: Some(terminal_selection_color),
-                                                ..HighlightStyle::default()
-                                            },
-                                        )
-                                    });
-                                    let cursor_highlight = cursor_range.clone().map(|range| {
-                                        (
-                                            range,
-                                            HighlightStyle {
-                                                color: Some(rgb(0x111827).into()),
-                                                ..HighlightStyle::default()
-                                            },
-                                        )
-                                    });
-                                    let highlights =
-                                        combine_highlights(base_highlights, search_highlights);
-                                    let highlights = combine_highlights(highlights, selected);
-                                    let highlights =
-                                        combine_highlights(highlights, cursor_highlight)
-                                            .collect::<Vec<_>>();
-                                    let begin_view = terminal_select_view.clone();
-                                    let update_view = terminal_select_view.clone();
-                                    let select_id = terminal_select_id.clone();
-                                    let update_id = terminal_select_id.clone();
-                                    let content_left = terminal_left_for_lines.clone();
-                                    let update_content_left = terminal_left_for_lines.clone();
-                                    let begin_scroll = terminal_scroll_for_selection.clone();
-                                    let update_scroll = terminal_scroll_for_selection.clone();
-                                    let begin_line = line.clone();
-                                    let update_line = line.clone();
-                                    div()
-                                        .h(px(terminal_font_size * 1.45))
-                                        .min_w_full()
-                                        .px_2()
-                                        .font_family("monospace")
-                                        .text_size(px(terminal_font_size))
-                                        .line_height(px(terminal_font_size * 1.45))
-                                        .text_color(rgb(0x111827))
-                                        .whitespace_nowrap()
-                                        .cursor_text()
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |event, window, cx| {
-                                                let column = terminal_column(
-                                                    event.position.x,
-                                                    content_left.get()
-                                                        + f32::from(
-                                                            begin_scroll
-                                                                .0
-                                                                .borrow()
-                                                                .base_handle
-                                                                .offset()
-                                                                .x,
-                                                        ),
-                                                    terminal_font_size,
-                                                    &begin_line,
-                                                    window,
-                                                );
-                                                begin_view.update(cx, |this, cx| {
-                                                    this.begin_ssh_terminal_selection(
-                                                        &select_id, index, column, cx,
-                                                    )
-                                                });
-                                            },
-                                        )
-                                        .on_mouse_move(move |event, window, cx| {
-                                            if !event.dragging() {
-                                                return;
-                                            }
-                                            let column = terminal_column(
-                                                event.position.x,
-                                                update_content_left.get()
-                                                    + f32::from(
-                                                        update_scroll
-                                                            .0
-                                                            .borrow()
-                                                            .base_handle
-                                                            .offset()
-                                                            .x,
-                                                    ),
-                                                terminal_font_size,
-                                                &update_line,
-                                                window,
-                                            );
-                                            update_view.update(cx, |this, cx| {
-                                                this.update_ssh_terminal_selection(
-                                                    &update_id, index, column, cx,
+                                                    terminal_highlight(span.style),
                                                 )
                                             });
+                                            let search_highlights = terminal_search_matches
+                                                .iter()
+                                                .filter(|matched| matched.line == index)
+                                                .map(|matched| {
+                                                    let is_active = active_terminal_search_match
+                                                        .as_ref()
+                                                        .is_some_and(|active| active == matched);
+                                                    (
+                                                        terminal_display_range(
+                                                            matched.range.clone(),
+                                                            cursor_range.as_ref(),
+                                                        ),
+                                                        HighlightStyle {
+                                                            background_color: Some(
+                                                                rgb(if is_active {
+                                                                    0xf59e0b
+                                                                } else {
+                                                                    0xfde68a
+                                                                })
+                                                                .opacity(if is_active {
+                                                                    0.9
+                                                                } else {
+                                                                    0.65
+                                                                })
+                                                                .into(),
+                                                            ),
+                                                            color: is_active
+                                                                .then_some(rgb(0x111827).into()),
+                                                            ..HighlightStyle::default()
+                                                        },
+                                                    )
+                                                });
+                                            let selected = terminal_selection_range(
+                                                index,
+                                                &line.text,
+                                                terminal_selection,
+                                            )
+                                            .map(|range| {
+                                                (
+                                                    terminal_display_range(
+                                                        range,
+                                                        cursor_range.as_ref(),
+                                                    ),
+                                                    HighlightStyle {
+                                                        background_color: Some(
+                                                            terminal_selection_color,
+                                                        ),
+                                                        ..HighlightStyle::default()
+                                                    },
+                                                )
+                                            });
+                                            let cursor_highlight =
+                                                cursor_range.clone().map(|range| {
+                                                    (
+                                                        range,
+                                                        HighlightStyle {
+                                                            color: Some(rgb(0x111827).into()),
+                                                            ..HighlightStyle::default()
+                                                        },
+                                                    )
+                                                });
+                                            let highlights = combine_highlights(
+                                                base_highlights,
+                                                search_highlights,
+                                            );
+                                            let highlights =
+                                                combine_highlights(highlights, selected);
+                                            let highlights =
+                                                combine_highlights(highlights, cursor_highlight)
+                                                    .collect::<Vec<_>>();
+                                            let begin_view = terminal_select_view.clone();
+                                            let update_view = terminal_select_view.clone();
+                                            let select_id = terminal_select_id.clone();
+                                            let update_id = terminal_select_id.clone();
+                                            let content_left = terminal_left_for_lines.clone();
+                                            let update_content_left =
+                                                terminal_left_for_lines.clone();
+                                            let begin_scroll =
+                                                terminal_scroll_for_selection.clone();
+                                            let update_scroll =
+                                                terminal_scroll_for_selection.clone();
+                                            let begin_line = line.clone();
+                                            let update_line = line.clone();
+                                            div()
+                                                .h(px(terminal_font_size
+                                                    * TERMINAL_LINE_HEIGHT_FACTOR))
+                                                .min_w_full()
+                                                .pl_2()
+                                                .font_family("monospace")
+                                                .text_size(px(terminal_font_size))
+                                                .line_height(px(terminal_font_size
+                                                    * TERMINAL_LINE_HEIGHT_FACTOR))
+                                                .text_color(rgb(0x111827))
+                                                .whitespace_nowrap()
+                                                .cursor_text()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |event, window, cx| {
+                                                        let column = terminal_column(
+                                                            event.position.x,
+                                                            content_left.get()
+                                                                + f32::from(
+                                                                    begin_scroll
+                                                                        .0
+                                                                        .borrow()
+                                                                        .base_handle
+                                                                        .offset()
+                                                                        .x,
+                                                                ),
+                                                            terminal_font_size,
+                                                            &begin_line,
+                                                            window,
+                                                        );
+                                                        begin_view.update(cx, |this, cx| {
+                                                            this.begin_ssh_terminal_selection(
+                                                                &select_id, index, column, cx,
+                                                            )
+                                                        });
+                                                    },
+                                                )
+                                                .on_mouse_move(move |event, window, cx| {
+                                                    if !event.dragging() {
+                                                        return;
+                                                    }
+                                                    let column = terminal_column(
+                                                        event.position.x,
+                                                        update_content_left.get()
+                                                            + f32::from(
+                                                                update_scroll
+                                                                    .0
+                                                                    .borrow()
+                                                                    .base_handle
+                                                                    .offset()
+                                                                    .x,
+                                                            ),
+                                                        terminal_font_size,
+                                                        &update_line,
+                                                        window,
+                                                    );
+                                                    update_view.update(cx, |this, cx| {
+                                                        this.update_ssh_terminal_selection(
+                                                            &update_id, index, column, cx,
+                                                        )
+                                                    });
+                                                })
+                                                .child(
+                                                    StyledText::new(display_text)
+                                                        .with_highlights(highlights),
+                                                )
                                         })
-                                        .child(
-                                            StyledText::new(display_text)
-                                                .with_highlights(highlights),
-                                        )
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    )
-                    .track_scroll(&tab.terminal_scroll)
-                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                    .pr(px(16.))
-                    .size_full(),
+                                        .collect::<Vec<_>>()
+                                },
+                            )
+                            .track_scroll(&tab.terminal_scroll)
+                            .with_horizontal_sizing_behavior(
+                                ListHorizontalSizingBehavior::Unconstrained,
+                            )
+                            .size_full(),
+                        ),
                 )
                 .child(
                     div()
@@ -1114,6 +1174,8 @@ fn render_terminal(
                 .context_menu(move |menu, _, _| {
                     let copy_view = terminal_copy_view.clone();
                     let copy_id = terminal_copy_id.clone();
+                    let paste_view = terminal_paste_view.clone();
+                    let paste_id = terminal_paste_id.clone();
                     menu.item(
                         PopupMenuItem::new("复制选中内容").on_click(move |_, _, cx| {
                             copy_view.update(cx, |this, cx| {
@@ -1121,6 +1183,11 @@ fn render_terminal(
                             });
                         }),
                     )
+                    .item(PopupMenuItem::new("粘贴").on_click(move |_, _, cx| {
+                        paste_view.update(cx, |this, cx| {
+                            this.paste_ssh_terminal_clipboard(&paste_id, cx);
+                        });
+                    }))
                 })
         }))
         .child(
@@ -1212,6 +1279,9 @@ fn render_transfer_panel(
         let cancel_view = view.clone();
         let cancel_tab_id = tab.id.clone();
         let cancel_transfer_id = transfer.id.clone();
+        let remove_view = view.clone();
+        let remove_tab_id = tab.id.clone();
+        let remove_transfer_id = transfer.id.clone();
         let speed = snapshot.bytes_per_second();
         let transfer_detail = if snapshot.stage == TransferStage::Scanning {
             "正在扫描文件…".to_string()
@@ -1308,7 +1378,25 @@ fn render_transfer_panel(
                                     }),
                             )
                         },
-                    ),
+                    )
+                    .when(transfer.status.is_finished(), |row| {
+                        row.child(
+                            Button::new(format!("remove-transfer-{}", transfer.id))
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::Delete)
+                                .tooltip("删除任务记录")
+                                .on_click(move |_, _, cx| {
+                                    remove_view.update(cx, |this, cx| {
+                                        this.remove_ssh_transfer(
+                                            &remove_tab_id,
+                                            &remove_transfer_id,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                    }),
             )
             .child(
                 Progress::new(format!("transfer-total-{}", transfer.id))
@@ -1334,16 +1422,22 @@ fn render_transfer_panel(
                     )),
             )
             .child(
-                h_flex()
-                    .justify_between()
+                v_flex()
+                    .gap_1()
+                    .w_full()
+                    .whitespace_normal()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(transfer_detail)
-                    .child(format!(
-                        "开始 {}  结束 {}",
-                        transfer.started_at,
+                    .child(div().w_full().child(transfer_detail))
+                    .child(
+                        div()
+                            .w_full()
+                            .child(format!("开始：{}", transfer.started_at)),
+                    )
+                    .child(div().w_full().child(format!(
+                        "结束：{}",
                         transfer.finished_at.as_deref().unwrap_or("-")
-                    )),
+                    ))),
             )
             .when_some(
                 match &transfer.status {
@@ -1463,6 +1557,7 @@ fn render_file_panel(
     let entry_upload_view = view.clone();
     let file_view_settings = view.clone();
     let panel_view = view.clone();
+    let clear_transfers_view = view.clone();
     let name_sort_view = view.clone();
     let modified_sort_view = view.clone();
     let parent_id = tab.id.clone();
@@ -1475,6 +1570,7 @@ fn render_file_panel(
     let entry_upload_id = tab.id.clone();
     let file_view_settings_id = tab.id.clone();
     let panel_view_id = tab.id.clone();
+    let clear_transfers_id = tab.id.clone();
     let name_sort_id = tab.id.clone();
     let modified_sort_id = tab.id.clone();
     let parent = crate::forward::parent_path(&tab.remote_path);
@@ -1482,6 +1578,10 @@ fn render_file_panel(
     let show_file_size = tab.show_file_size;
     let show_file_permissions = tab.show_file_permissions;
     let showing_transfers = tab.file_panel_view == SshFilePanelView::Transfers;
+    let has_finished_transfers = tab
+        .transfers
+        .iter()
+        .any(|transfer| transfer.status.is_finished());
     let transfer_panel = showing_transfers.then(|| render_transfer_panel(tab, view, cx));
     let sorted_entries = sorted_remote_entries(
         &tab.remote_entries,
@@ -1805,7 +1905,22 @@ fn render_file_panel(
                                 this.toggle_ssh_file_panel_view(&panel_view_id, cx)
                             });
                         }),
-                ),
+                )
+                .when(showing_transfers, |header| {
+                    header.child(
+                        Button::new(format!("clear-finished-transfers-{}", tab.id))
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Delete)
+                            .tooltip("清空已完成的任务")
+                            .disabled(!has_finished_transfers)
+                            .on_click(move |_, _, cx| {
+                                clear_transfers_view.update(cx, |this, cx| {
+                                    this.clear_finished_ssh_transfers(&clear_transfers_id, cx)
+                                });
+                            }),
+                    )
+                }),
         )
         .when(!showing_transfers, |panel| {
             panel.child(
@@ -1879,16 +1994,6 @@ fn render_file_panel(
                         drop_view.update(cx, |this, cx| {
                             this.upload_ssh_paths(&drop_id, paths.paths().to_vec(), window, cx)
                         });
-                    })
-                    .when(tab.file_loading, |list| {
-                        list.child(
-                            div()
-                                .py_6()
-                                .text_center()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("正在读取目录…"),
-                        )
                     })
                     .when(
                         !tab.file_loading
@@ -2060,8 +2165,8 @@ pub(in crate::ui) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> 
 mod tests {
     use super::{
         DEFAULT_SSH_TERMINAL_FONT_SIZE, RemoteSortField, set_terminal_scroll_from_thumb,
-        sorted_remote_entries, terminal_display_range, terminal_scrollbar_metrics,
-        terminal_text_with_cursor,
+        sorted_remote_entries, terminal_display_range, terminal_grid_size,
+        terminal_scrollbar_metrics, terminal_text_with_cursor,
     };
     use crate::forward::{RemoteEntry, TerminalLine};
     use gpui::UniformListScrollHandle;
@@ -2069,6 +2174,12 @@ mod tests {
     #[test]
     fn ssh_terminal_default_font_size_is_twelve_pixels() {
         assert_eq!(DEFAULT_SSH_TERMINAL_FONT_SIZE, 12.);
+    }
+
+    #[test]
+    fn terminal_grid_uses_visible_text_area() {
+        assert_eq!(terminal_grid_size(800., 500., 12., 7.2), (110, 28));
+        assert_eq!(terminal_grid_size(40., 40., 12., 7.2), (20, 5));
     }
 
     fn entry(name: &str, modified_at: u64) -> RemoteEntry {

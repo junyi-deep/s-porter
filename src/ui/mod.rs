@@ -4,6 +4,7 @@ mod forwarding;
 mod search;
 mod server;
 mod ssh;
+mod table_sort;
 mod tools;
 
 use std::borrow::Cow;

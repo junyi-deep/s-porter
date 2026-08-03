@@ -547,4 +547,37 @@ impl AppView {
             cx.notify();
         }
     }
+
+    pub(in crate::ui) fn remove_ssh_transfer(
+        &mut self,
+        tab_id: &str,
+        transfer_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let before = tab.transfers.len();
+        tab.transfers
+            .retain(|transfer| transfer.id != transfer_id || !transfer.status.is_finished());
+        if tab.transfers.len() != before {
+            cx.notify();
+        }
+    }
+
+    pub(in crate::ui) fn clear_finished_ssh_transfers(
+        &mut self,
+        tab_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.ssh.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let before = tab.transfers.len();
+        tab.transfers
+            .retain(|transfer| !transfer.status.is_finished());
+        if tab.transfers.len() != before {
+            cx.notify();
+        }
+    }
 }

@@ -89,6 +89,36 @@ fn terminal_modifier_code(modifiers: Modifiers) -> u8 {
     1 + u8::from(modifiers.shift) + u8::from(modifiers.alt) * 2 + u8::from(modifiers.control) * 4
 }
 
+pub(in crate::ui) fn is_terminal_copy_shortcut(keystroke: &Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    let ctrl_insert = modifiers.control
+        && !modifiers.shift
+        && !modifiers.alt
+        && !modifiers.platform
+        && keystroke.key.eq_ignore_ascii_case("insert");
+    ctrl_insert
+        || if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.control && keystroke.key.eq_ignore_ascii_case("c")
+        } else {
+            modifiers.control && modifiers.shift && keystroke.key.eq_ignore_ascii_case("c")
+        }
+}
+
+pub(in crate::ui) fn is_terminal_paste_shortcut(keystroke: &Keystroke) -> bool {
+    let modifiers = keystroke.modifiers;
+    let shift_insert = modifiers.shift
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+        && keystroke.key.eq_ignore_ascii_case("insert");
+    shift_insert
+        || if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.control && keystroke.key.eq_ignore_ascii_case("v")
+        } else {
+            modifiers.control && modifiers.shift && keystroke.key.eq_ignore_ascii_case("v")
+        }
+}
+
 // Keyboard encoding follows the same xterm mappings used by Zed's terminal,
 // whose implementation is derived from Alacritty's terminal input mapping.
 pub(in crate::ui) fn terminal_key_bytes(

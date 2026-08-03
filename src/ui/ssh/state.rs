@@ -27,6 +27,12 @@ pub(in crate::ui) enum TransferStatus {
     Failed(String),
 }
 
+impl TransferStatus {
+    pub(in crate::ui) fn is_finished(&self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed(_))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::ui) enum SshFilePanelView {
     Files,

@@ -584,8 +584,9 @@ impl Render for AppView {
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalPoint, TerminalSelection, parse_jump_host_batch_entries, remember_command,
-        terminal_key_bytes, terminal_search_matches, terminal_selected_text,
+        TerminalPoint, TerminalSelection, is_terminal_copy_shortcut, is_terminal_paste_shortcut,
+        parse_jump_host_batch_entries, remember_command, terminal_key_bytes,
+        terminal_search_matches, terminal_selected_text,
     };
     use crate::forward::TerminalLine;
     use gpui::Keystroke;
@@ -644,6 +645,12 @@ mod tests {
 
     #[test]
     fn terminal_keys_encode_control_and_full_screen_navigation() {
+        assert!(is_terminal_copy_shortcut(
+            &Keystroke::parse("ctrl-insert").unwrap()
+        ));
+        assert!(is_terminal_paste_shortcut(
+            &Keystroke::parse("shift-insert").unwrap()
+        ));
         assert_eq!(
             terminal_key_bytes(&Keystroke::parse("tab").unwrap(), false, true),
             Some(vec![b'\t'])

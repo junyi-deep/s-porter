@@ -1,6 +1,7 @@
 use crate::ui::{
     app::AppView,
     dialog_layout::{responsive_dialog, scrollable_dialog_body},
+    table_sort::{MultiSort, compare_address, compare_text},
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -24,6 +25,15 @@ struct JumpHostTableRow {
     selected: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JumpHostSortField {
+    Name,
+    Address,
+    Port,
+    Username,
+    Relations,
+}
+
 pub(in crate::ui) struct JumpHostTableDelegate {
     view: WeakEntity<AppView>,
     columns: Vec<Column>,
@@ -31,6 +41,7 @@ pub(in crate::ui) struct JumpHostTableDelegate {
     visible_ids: Vec<String>,
     all_selected: bool,
     empty_message: String,
+    sort: MultiSort<JumpHostSortField>,
 }
 
 impl JumpHostTableDelegate {
@@ -49,11 +60,16 @@ impl JumpHostTableDelegate {
                     .width(px(180.))
                     .min_width(px(100.))
                     .max_width(px(360.)),
-                Column::new("address", "SSH 服务")
+                Column::new("address", "SSH 地址")
                     .p_0()
-                    .width(px(220.))
-                    .min_width(px(130.))
-                    .max_width(px(420.)),
+                    .width(px(180.))
+                    .min_width(px(110.))
+                    .max_width(px(360.)),
+                Column::new("port", "端口")
+                    .p_0()
+                    .width(px(90.))
+                    .min_width(px(70.))
+                    .max_width(px(160.)),
                 Column::new("username", "登录用户")
                     .p_0()
                     .width(px(140.))
@@ -75,7 +91,46 @@ impl JumpHostTableDelegate {
             visible_ids: Vec::new(),
             all_selected: false,
             empty_message: "暂无服务器，点击右上角新增".into(),
+            sort: MultiSort::default(),
         }
+    }
+
+    fn sort_field(col_ix: usize) -> Option<JumpHostSortField> {
+        match col_ix {
+            1 => Some(JumpHostSortField::Name),
+            2 => Some(JumpHostSortField::Address),
+            3 => Some(JumpHostSortField::Port),
+            4 => Some(JumpHostSortField::Username),
+            5 => Some(JumpHostSortField::Relations),
+            _ => None,
+        }
+    }
+
+    fn sort_rows(&mut self) {
+        self.rows.sort_by(|left, right| {
+            self.sort
+                .compare(left, right, |field, left, right| match field {
+                    JumpHostSortField::Name => compare_text(&left.host.name, &right.host.name),
+                    JumpHostSortField::Address => {
+                        compare_address(&left.host.host, &right.host.host)
+                    }
+                    JumpHostSortField::Port => left.host.port.cmp(&right.host.port),
+                    JumpHostSortField::Username => {
+                        compare_text(&left.host.username, &right.host.username)
+                    }
+                    JumpHostSortField::Relations => left
+                        .forward_count
+                        .cmp(&right.forward_count)
+                        .then_with(|| left.connection_count.cmp(&right.connection_count)),
+                })
+                .then_with(|| compare_text(&left.host.name, &right.host.name))
+                .then_with(|| left.host.id.cmp(&right.host.id))
+        });
+    }
+
+    fn toggle_sort(&mut self, field: JumpHostSortField, additive: bool) {
+        self.sort.toggle(field, additive);
+        self.sort_rows();
     }
 
     fn update_rows(
@@ -89,6 +144,7 @@ impl JumpHostTableDelegate {
         self.visible_ids = visible_ids;
         self.all_selected = all_selected;
         self.empty_message = empty_message;
+        self.sort_rows();
     }
 }
 
@@ -137,8 +193,22 @@ impl TableDelegate for JumpHostTableDelegate {
                 )
                 .into_any_element()
         } else {
+            let Some(field) = Self::sort_field(col_ix) else {
+                return header
+                    .child(self.columns[col_ix].name.clone())
+                    .into_any_element();
+            };
+            let label = self.sort.label(field, &self.columns[col_ix].name);
+            let sort_click = cx.listener(move |table, event: &ClickEvent, window, cx| {
+                let additive = event.modifiers().shift || window.modifiers().shift;
+                table.delegate_mut().toggle_sort(field, additive);
+                cx.notify();
+            });
             header
-                .child(self.columns[col_ix].name.clone())
+                .id(("jump-host-sort", col_ix))
+                .cursor_pointer()
+                .child(label)
+                .on_click(sort_click)
                 .into_any_element()
         }
     }
@@ -183,15 +253,13 @@ impl TableDelegate for JumpHostTableDelegate {
                 .into_any_element(),
             2 => cell
                 .child(
-                    TextView::markdown(
-                        format!("host-address-{}", host.id),
-                        format!("{}:{}", host.host, host.port),
-                    )
-                    .selectable(true),
+                    TextView::markdown(format!("host-address-{}", host.id), host.host)
+                        .selectable(true),
                 )
                 .into_any_element(),
-            3 => cell.child(host.username).into_any_element(),
-            4 => cell
+            3 => cell.child(host.port.to_string()).into_any_element(),
+            4 => cell.child(host.username).into_any_element(),
+            5 => cell
                 .text_color(cx.theme().muted_foreground)
                 .child(format!(
                     "{} 转发 / {} 连接",
@@ -687,6 +755,12 @@ pub(in crate::ui) fn render(
                         .child(
                             Input::new(&view_state.servers.search)
                                 .prefix(Icon::new(IconName::Search).small()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("点击列头设置主排序；Shift + 点击追加低优先级排序"),
                         )
                         .when_some(search_error, |field, error| {
                             field.child(div().text_xs().text_color(cx.theme().danger).child(error))
