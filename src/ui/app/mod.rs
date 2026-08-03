@@ -7,7 +7,10 @@ use super::{
     forwarding::page as forward_page,
     server::page as jump_host_page,
     ssh::{page as ssh_page, state::*, terminal::*},
-    tools::{format as format_page, text as tool_page, time as time_page, update as update_page},
+    tools::{
+        drawing as drawing_page, format as format_page, text as tool_page, time as time_page,
+        update as update_page,
+    },
 };
 use crate::{
     forward::{self, ForwardConfig, HttpProxyConfig, JumpHost},
@@ -176,6 +179,7 @@ pub(super) struct AppView {
     pub(super) codec_tools: Entity<tool_page::ToolState>,
     pub(super) format_tools: Entity<format_page::FormatToolState>,
     pub(super) time_tools: time_page::TimeToolState,
+    pub(super) drawing_tools: drawing_page::DrawingToolState,
     pub(super) message_center: Entity<message_center::MessageCenter>,
     pub(super) distribution: crate::Distribution,
     pub(super) updates: Entity<update_page::UpdateModel>,
@@ -325,6 +329,7 @@ impl AppView {
             codec_tools: cx.new(|cx| tool_page::ToolState::new(window, cx)),
             format_tools: cx.new(|cx| format_page::FormatToolState::new(window, cx)),
             time_tools: time_page::TimeToolState::new(window, cx),
+            drawing_tools: drawing_page::DrawingToolState::new(),
             message_center,
             distribution,
             updates,
@@ -447,6 +452,7 @@ impl Render for AppView {
                 format_page::render(self.format_tools.clone(), message_center.clone(), cx)
             }
             Page::Time => time_page::render(self, cx),
+            Page::Drawing => drawing_page::render(&mut self.drawing_tools, window, cx),
             Page::Update => update_page::render(self.updates.clone(), self.distribution, cx),
         };
         let main_content = div().size_full().min_w_0().child(page_content);

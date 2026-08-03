@@ -50,6 +50,7 @@ pub(super) fn render(view_state: &AppView, cx: &mut Context<AppView>) -> impl In
                 menu_item("编解码工具", IconName::Inspector, Page::Codec),
                 menu_item("格式化工具", IconName::File, Page::Format),
                 menu_item("时间工具", IconName::Calendar, Page::Time),
+                menu_item("绘图工具", IconName::Palette, Page::Drawing),
             ])),
         )
         .child(

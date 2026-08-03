@@ -76,6 +76,11 @@ fn config_path() -> Result<PathBuf> {
     Ok(dirs.config_dir().join("forwards.json"))
 }
 
+pub(crate) fn drawing_data_dir() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("dev", "s-porter", "S Porter").context("无法确定应用数据目录")?;
+    Ok(dirs.data_dir().join("drawings"))
+}
+
 pub fn load() -> Result<AppConfig> {
     let path = config_path()?;
     if !path.exists() {

@@ -9,6 +9,7 @@ pub(in crate::ui) enum Page {
     Codec,
     Format,
     Time,
+    Drawing,
     Update,
 }
 
